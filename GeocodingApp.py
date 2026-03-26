@@ -23,38 +23,48 @@ skip_existing = st.sidebar.checkbox("Skip rows that already have coordinates", v
 st.sidebar.header("Cache")
 if "_geocode_cache" not in st.session_state:
     st.session_state["_geocode_cache"] = {}
+if "_confirm_clear" not in st.session_state:
+    st.session_state["_confirm_clear"] = False
+
 cache_display = st.sidebar.empty()
 cache_display.caption(f"**{len(st.session_state['_geocode_cache'])}** addresses cached this session.")
-if st.sidebar.button("🗑️ Clear cache"):
-    st.session_state["_geocode_cache"] = {}
-    cache_display.caption("**0** addresses cached this session.")
-    st.sidebar.success("Cache cleared.")
-    st.rerun()
 
-CORE_FIELDS = ["AddressID", "StreetAddress", "Latitude", "Longitude"]
+if not st.session_state["_confirm_clear"]:
+    if st.sidebar.button("🗑️ Clear cache"):
+        st.session_state["_confirm_clear"] = True
+        st.rerun()
+else:
+    st.sidebar.warning("Are you sure? This cannot be undone.")
+    col_yes, col_no = st.sidebar.columns(2)
+    with col_yes:
+        if st.button("Yes, clear", type="primary"):
+            st.session_state["_geocode_cache"] = {}
+            st.session_state["_confirm_clear"] = False
+            st.rerun()
+    with col_no:
+        if st.button("Cancel"):
+            st.session_state["_confirm_clear"] = False
+            st.rerun()
+
+CORE_FIELDS = ["StreetAddress"]
+COORD_FIELDS = ["Latitude", "Longitude"]
+OPTIONAL_ID = "AddressID"
 LOCATION_FIELDS = ["CityName", "Admin2Name", "Admin1Name", "PostalCode", "CountryCode"]
-ALL_FIELDS = CORE_FIELDS + LOCATION_FIELDS
+ALL_FIELDS = [OPTIONAL_ID] + CORE_FIELDS + COORD_FIELDS + LOCATION_FIELDS
 UNMAPPED = "-- Not mapped --"
 
-# Australian postcode -> state mapping for validation
 AU_POSTCODE_STATE = {
     "1": "New South Wales", "2": "New South Wales", "3": "Victoria",
     "4": "Queensland", "5": "South Australia", "6": "Western Australia",
     "7": "Tasmania", "0": "Northern Territory",
 }
-US_STATE_ZIPS = {
-    "AL": (35, 36), "AK": (99, 99), "AZ": (85, 86), "AR": (71, 72), "CA": (90, 96),
-    "CO": (80, 81), "CT": (6, 6), "DE": (19, 19), "FL": (32, 34), "GA": (30, 31),
-    "HI": (96, 96), "ID": (83, 83), "IL": (60, 62), "IN": (46, 47), "IA": (50, 52),
-    "KS": (66, 67), "KY": (40, 42), "LA": (70, 71), "ME": (3, 4), "MD": (20, 21),
-    "MA": (1, 2), "MI": (48, 49), "MN": (55, 56), "MS": (38, 39), "MO": (63, 65),
-    "MT": (59, 59), "NE": (68, 69), "NV": (88, 89), "NH": (3, 3), "NJ": (7, 8),
-    "NM": (87, 88), "NY": (10, 14), "NC": (27, 28), "ND": (58, 58), "OH": (43, 45),
-    "OK": (73, 74), "OR": (97, 97), "PA": (15, 19), "RI": (2, 2), "SC": (29, 29),
-    "SD": (57, 57), "TN": (37, 38), "TX": (75, 79), "UT": (84, 84), "VT": (5, 5),
-    "VA": (20, 24), "WA": (98, 99), "WV": (24, 26), "WI": (53, 54), "WY": (82, 83),
-}
 
+LOCATION_TYPE_RANK = {"ROOFTOP": 4, "RANGE_INTERPOLATED": 3, "GEOMETRIC_CENTER": 2, "APPROXIMATE": 1}
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
 
 def haversine_m(lat1, lon1, lat2, lon2):
     R = 6_371_000
@@ -65,51 +75,42 @@ def haversine_m(lat1, lon1, lat2, lon2):
 
 
 def score_result_against_constraints(result, country_code=None, admin1=None, admin2=None, city=None, postal_code=None):
-    """Score how well a Google result matches the original constraint data. Higher = better match."""
     score = 0
     components = result.get("address_components", [])
-
-    def get_component(comp_type):
+    def get_comp(comp_type):
         for c in components:
             if comp_type in c.get("types", []):
                 return c.get("long_name", "").lower(), c.get("short_name", "").lower()
         return "", ""
-
     if country_code:
-        _, short = get_component("country")
+        _, short = get_comp("country")
         if short == country_code.lower():
-            score += 10  # Country match is most important
-
+            score += 10
     if admin1:
-        long_name, short_name = get_component("administrative_area_level_1")
+        ln, sn = get_comp("administrative_area_level_1")
         a1 = admin1.lower()
-        if a1 == long_name or a1 == short_name or long_name in a1 or a1 in long_name:
+        if a1 == ln or a1 == sn or ln in a1 or a1 in ln:
             score += 5
-
     if admin2:
-        long_name, short_name = get_component("administrative_area_level_2")
+        ln, sn = get_comp("administrative_area_level_2")
         a2 = admin2.lower()
-        if a2 == long_name or a2 == short_name or long_name in a2 or a2 in long_name:
+        if a2 == ln or a2 == sn or ln in a2 or a2 in ln:
             score += 3
-
     if city:
-        long_name, short_name = get_component("locality")
+        ln, sn = get_comp("locality")
         ct = city.lower()
-        if ct == long_name or ct == short_name or long_name in ct or ct in long_name:
+        if ct == ln or ct == sn or ln in ct or ct in ln:
             score += 3
-
     if postal_code:
-        long_name, short_name = get_component("postal_code")
+        ln, sn = get_comp("postal_code")
         pc = postal_code.lower()
-        if pc == long_name or pc == short_name or long_name.startswith(pc) or pc.startswith(long_name):
+        if pc == ln or pc == sn or ln.startswith(pc) or pc.startswith(ln):
             score += 4
-
     return score
 
 
 def single_geocode_call(address, key, components=None, country_code=None, admin1=None,
                         admin2=None, city=None, postal_code=None):
-    """Make one geocoding API call. Pick the best result: first by constraint match, then by precision."""
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     params = {"address": address, "key": key}
     if components:
@@ -127,14 +128,10 @@ def single_geocode_call(address, key, components=None, country_code=None, admin1
                 match_score = score_result_against_constraints(
                     result, country_code, admin1, admin2, city, postal_code)
                 scored.append((match_score, precision, result))
-
-            # Sort: constraint match first, then precision as tiebreaker
             scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
             best = scored[0][2]
             loc = best["geometry"]["location"]
             loc_type = best["geometry"].get("location_type", "UNKNOWN")
-
-            # Flag if we picked a lower-precision result because it matched constraints better
             constraint_picked = False
             if len(scored) > 1:
                 top_match, top_prec = scored[0][0], scored[0][1]
@@ -142,32 +139,20 @@ def single_geocode_call(address, key, components=None, country_code=None, admin1
                     if pr > top_prec and ms < top_match:
                         constraint_picked = True
                         break
-
             return {"lat": loc["lat"], "lng": loc["lng"], "status": "OK",
                     "location_type": loc_type, "constraint_picked": constraint_picked}
-        return {"lat": None, "lng": None, "status": status, "location_type": None,
-                "constraint_picked": False}
+        return {"lat": None, "lng": None, "status": status, "location_type": None, "constraint_picked": False}
     except requests.Timeout:
-        return {"lat": None, "lng": None, "status": "TIMEOUT", "location_type": None,
-                "constraint_picked": False}
+        return {"lat": None, "lng": None, "status": "TIMEOUT", "location_type": None, "constraint_picked": False}
     except requests.ConnectionError:
-        return {"lat": None, "lng": None, "status": "CONNECTION_ERROR", "location_type": None,
-                "constraint_picked": False}
-    except Exception as e:
-        return {"lat": None, "lng": None, "status": "ERROR", "location_type": None,
-                "constraint_picked": False}
+        return {"lat": None, "lng": None, "status": "CONNECTION_ERROR", "location_type": None, "constraint_picked": False}
+    except Exception:
+        return {"lat": None, "lng": None, "status": "ERROR", "location_type": None, "constraint_picked": False}
 
 
-LOCATION_TYPE_RANK = {"ROOFTOP": 4, "RANGE_INTERPOLATED": 3, "GEOMETRIC_CENTER": 2, "APPROXIMATE": 1}
-
-
-def geocode_address(full_address, street_address, key, country_code=None, city=None, admin1=None, admin2=None, postal_code=None):
-    """Geocode with constraints first using full address. If quality is below street level,
-    try with just the street address string, fully unconstrained."""
-
+def geocode_address(full_address, street_address, key, country_code=None, city=None,
+                    admin1=None, admin2=None, postal_code=None):
     api_calls = 0
-
-    # Build full constraint string
     all_comp = []
     if country_code:
         all_comp.append(f"country:{country_code}")
@@ -180,16 +165,11 @@ def geocode_address(full_address, street_address, key, country_code=None, city=N
     if city:
         all_comp.append(f"locality:{city}")
 
-    # Good enough = ROOFTOP or RANGE_INTERPOLATED (better than postal code level)
     GOOD_ENOUGH = {"ROOFTOP", "RANGE_INTERPOLATED"}
-
-    candidates = []
-
-    # Constraint kwargs for result scoring
     score_kwargs = {"country_code": country_code, "admin1": admin1, "admin2": admin2,
                     "city": city, "postal_code": postal_code}
+    candidates = []
 
-    # --- Attempt 1: Full address with all constraints ---
     if all_comp:
         r1 = single_geocode_call(full_address, key, "|".join(all_comp), **score_kwargs)
         api_calls += 1
@@ -199,7 +179,6 @@ def geocode_address(full_address, street_address, key, country_code=None, city=N
                 return {**r1, "method": "constrained", "fallback": False,
                         "addr_only_better": False, "detail": "", "api_calls": api_calls}
 
-        # --- Attempt 2: Drop city (only if attempt 1 wasn't good enough) ---
         no_city = [c for c in all_comp if not c.startswith("locality:")]
         if no_city and no_city != all_comp:
             r2 = single_geocode_call(full_address, key, "|".join(no_city), **score_kwargs)
@@ -208,11 +187,9 @@ def geocode_address(full_address, street_address, key, country_code=None, city=N
                 candidates.append(("constrained_no_city", r2))
                 if r2.get("location_type") in GOOD_ENOUGH:
                     return {**r2, "method": "constrained_no_city", "fallback": True,
-                            "addr_only_better": False,
-                            "detail": "Resolved after dropping city constraint.",
+                            "addr_only_better": False, "detail": "Resolved after dropping city constraint.",
                             "api_calls": api_calls}
 
-        # --- Attempt 3: Country only ---
         country_only = [c for c in all_comp if c.startswith("country:")]
         if country_only and country_only != no_city:
             r3 = single_geocode_call(full_address, key, "|".join(country_only), **score_kwargs)
@@ -221,11 +198,9 @@ def geocode_address(full_address, street_address, key, country_code=None, city=N
                 candidates.append(("country_only", r3))
                 if r3.get("location_type") in GOOD_ENOUGH:
                     return {**r3, "method": "country_only", "fallback": True,
-                            "addr_only_better": False,
-                            "detail": "Resolved with country constraint only.",
+                            "addr_only_better": False, "detail": "Resolved with country constraint only.",
                             "api_calls": api_calls}
 
-    # --- Still not good enough — try JUST the street address, fully unconstrained ---
     r_addr = single_geocode_call(street_address, key, None, **score_kwargs)
     api_calls += 1
     if r_addr["status"] == "OK":
@@ -233,21 +208,16 @@ def geocode_address(full_address, street_address, key, country_code=None, city=N
 
     if not candidates:
         detail = diagnose_failure(full_address, city, admin1, admin2, postal_code, country_code)
-        return {"lat": None, "lng": None, "status": "ZERO_RESULTS",
-                "location_type": None, "method": "failed", "fallback": False,
-                "addr_only_better": False, "detail": detail, "api_calls": api_calls}
+        return {"lat": None, "lng": None, "status": "ZERO_RESULTS", "location_type": None,
+                "method": "failed", "fallback": False, "addr_only_better": False,
+                "detail": detail, "api_calls": api_calls}
 
-    # Pick the best result across all attempts
-    best_method, best = None, None
-    best_rank = -1
+    best_method, best, best_rank = None, None, -1
     for method, r in candidates:
         rank = LOCATION_TYPE_RANK.get(r.get("location_type"), 0)
         if rank > best_rank:
-            best_rank = rank
-            best = r
-            best_method = method
+            best_rank, best, best_method = rank, r, method
 
-    # Check if address-only was better than the first constrained attempt
     constrained_rank = 0
     for method, r in candidates:
         if method == "constrained":
@@ -268,21 +238,18 @@ def geocode_address(full_address, street_address, key, country_code=None, city=N
     if addr_only_better:
         detail_parts.append("Data quality flag: unconstrained search outperformed constrained search.")
     if best and best.get("constraint_picked"):
-        detail_parts.append("A higher-precision result existed but was in the wrong location — chose the constraint-matching result instead. Manual check recommended.")
+        detail_parts.append("A higher-precision result existed but was in the wrong location — chose the constraint-matching result instead.")
 
     return {**best, "method": best_method, "fallback": best_method != "constrained",
-            "addr_only_better": addr_only_better, "detail": " ".join(detail_parts),
-            "api_calls": api_calls}
+            "addr_only_better": addr_only_better, "detail": " ".join(detail_parts), "api_calls": api_calls}
 
 
 def diagnose_failure(address, city, admin1, admin2, postal_code, country_code):
     addr_lower = address.lower() if address else ""
     reasons = []
-
     military = ["hmas", "raaf", "adf", "barracks", "base", "camp", "garrison", "depot", "armoury", "armory"]
     if any(kw in addr_lower for kw in military):
         reasons.append("Military/defence facility — Google often can't resolve internal base roads. Manual geocoding recommended.")
-
     state_abbrevs = {"nsw": "new south wales", "vic": "victoria", "qld": "queensland",
                      "sa": "south australia", "wa": "western australia", "tas": "tasmania",
                      "nt": "northern territory", "act": "australian capital territory"}
@@ -294,19 +261,14 @@ def diagnose_failure(address, city, admin1, admin2, postal_code, country_code):
             break
     if embedded_state and admin1 and embedded_state != admin1.lower():
         reasons.append(f"Address contains '{embedded_state.title()}' but Admin1 says '{admin1}' — conflicting states.")
-
     if city:
         city_words = set(city.lower().split())
-        addr_words = set(addr_parts)
-        if not city_words.intersection(addr_words) and len(address) > 20:
+        if not city_words.intersection(set(addr_parts)) and len(address) > 20:
             reasons.append(f"CityName '{city}' doesn't appear in the address — possible mismatch.")
-
     if city and city.lower().endswith(" city") and country_code and country_code.upper() == "AU":
         reasons.append(f"CityName '{city}' has 'City' suffix — try just '{city.rsplit(' ', 1)[0]}'.")
-
     if len((address or "").split(",")[0].strip()) < 10:
         reasons.append("Very short street address — may be incomplete.")
-
     if not reasons:
         reasons.append("Google could not find this address. Check for typos or incomplete details.")
     return " | ".join(reasons)
@@ -326,7 +288,7 @@ def guess_column(field_name, available):
         "addressid": ["id", "address_id", "addr_id", "locid", "location_id"],
         "latitude": ["lat", "y"],
         "longitude": ["lng", "lon", "long", "x"],
-        "countrycode": ["country", "countryiso", "iso2", "iso2a", "country_code", "cntry", "country code"],
+        "countrycode": ["country", "countryiso", "iso2", "iso2a", "country_code", "cntry", "country code", "cntrycode"],
         "cityname": ["city", "town", "locality", "suburb", "city_name"],
         "admin1name": ["admin1", "state", "province", "region", "admin1_name", "statename"],
         "admin2name": ["admin2", "county", "district", "admin2_name", "countyname"],
@@ -338,6 +300,10 @@ def guess_column(field_name, available):
             return col
     return UNMAPPED
 
+
+# =============================================================================
+# FILE READING
+# =============================================================================
 
 def read_raw_file(uploaded_file):
     name = uploaded_file.name.lower()
@@ -404,6 +370,10 @@ def apply_header(raw_df, header_row):
     return df, None
 
 
+# =============================================================================
+# VALIDATION
+# =============================================================================
+
 def validate_dataframe(df, skip):
     errors, warnings, flagged_rows = [], [], {}
     total_rows = len(df)
@@ -415,26 +385,25 @@ def validate_dataframe(df, skip):
         errors.append(msg)
         flagged_rows["Blank StreetAddress"] = df.loc[blank_addr]
 
-    blank_id = df["AddressID"].isna() | (df["AddressID"].astype(str).str.strip() == "")
-    bi_count = int(blank_id.sum())
-    if bi_count > 0:
-        msg = "**Every row** has a blank `AddressID`." if bi_count == total_rows else f"**{bi_count}** of {total_rows} rows have blank `AddressID`."
-        errors.append(msg)
-        flagged_rows["Blank AddressID"] = df.loc[blank_id]
-
-    id_col = df["AddressID"].astype(str).str.strip()
-    non_blank_ids = id_col[~blank_id]
-    dup_ids = non_blank_ids[non_blank_ids.duplicated(keep=False)]
-    if len(dup_ids) > 0:
-        errors.append(f"**{dup_ids.nunique()}** `AddressID`(s) are duplicated across **{len(dup_ids)}** rows.")
-        flagged_rows["Duplicate AddressID"] = df.loc[dup_ids.index]
-        check = df.loc[dup_ids.index].copy()
-        check["_id"] = check["AddressID"].astype(str).str.strip()
-        check["_addr"] = check["StreetAddress"].astype(str).str.strip().str.lower()
-        conf = check.groupby("_id").filter(lambda g: g["_addr"].nunique() > 1)
-        if len(conf) > 0:
-            errors.append(f"**{conf['_id'].nunique()}** `AddressID`(s) linked to different addresses.")
-            flagged_rows["Conflicting ID/Address"] = df.loc[conf.index]
+    is_auto_id = df["AddressID"].astype(str).str.startswith("ROW_").all()
+    if not is_auto_id:
+        blank_id = df["AddressID"].isna() | (df["AddressID"].astype(str).str.strip() == "")
+        bi_count = int(blank_id.sum())
+        if bi_count > 0:
+            warnings.append(f"**{bi_count}** of {total_rows} rows have blank `AddressID`.")
+            flagged_rows["Blank AddressID"] = df.loc[blank_id]
+        non_blank_ids = df["AddressID"].astype(str).str.strip()[~blank_id]
+        dup_ids = non_blank_ids[non_blank_ids.duplicated(keep=False)]
+        if len(dup_ids) > 0:
+            warnings.append(f"**{dup_ids.nunique()}** `AddressID`(s) duplicated across **{len(dup_ids)}** rows.")
+            flagged_rows["Duplicate AddressID"] = df.loc[dup_ids.index]
+            check = df.loc[dup_ids.index].copy()
+            check["_id"] = check["AddressID"].astype(str).str.strip()
+            check["_addr"] = check["StreetAddress"].astype(str).str.strip().str.lower()
+            conf = check.groupby("_id").filter(lambda g: g["_addr"].nunique() > 1)
+            if len(conf) > 0:
+                warnings.append(f"**{conf['_id'].nunique()}** `AddressID`(s) linked to different addresses.")
+                flagged_rows["Conflicting ID/Address"] = df.loc[conf.index]
 
     lat_raw, lng_raw = df["Latitude"], df["Longitude"]
     lat_num = pd.to_numeric(lat_raw, errors="coerce")
@@ -458,7 +427,6 @@ def validate_dataframe(df, skip):
         warnings.append(f"**{int(short.sum())}** row(s) have very short addresses.")
         flagged_rows["Short Addresses"] = df.loc[short]
 
-    # --- Data quality checks: postcode vs admin1 ---
     if "PostalCode" in df.columns and "Admin1Name" in df.columns and "CountryCode" in df.columns:
         dq_flags = []
         for idx, row in df.iterrows():
@@ -467,26 +435,15 @@ def validate_dataframe(df, skip):
             pc = str(row.get("PostalCode", "")).strip()
             a1 = str(row.get("Admin1Name", "")).strip()
             cc = str(row.get("CountryCode", "")).strip().upper()
-
             if cc == "AU" and pc and a1:
                 first_digit = pc[0] if pc else ""
-                expected_state = AU_POSTCODE_STATE.get(first_digit, "")
-                if expected_state and expected_state.lower() != a1.lower():
+                expected = AU_POSTCODE_STATE.get(first_digit, "")
+                if expected and expected.lower() != a1.lower():
                     dq_flags.append(idx)
-            elif cc == "US" and pc and a1:
-                try:
-                    zip_prefix = int(pc[:2])
-                    for st, (lo, hi) in US_STATE_ZIPS.items():
-                        if lo <= zip_prefix <= hi and st.lower() != a1.lower() and a1.lower() not in ["", "nan"]:
-                            pass  # Could flag but US state names vs codes makes this complex
-                except (ValueError, IndexError):
-                    pass
-
         if dq_flags:
-            warnings.append(f"**{len(dq_flags)}** row(s) have a postal code that doesn't match the Admin1 region — possible data quality issue.")
+            warnings.append(f"**{len(dq_flags)}** row(s) have postcode/Admin1 mismatch.")
             flagged_rows["Postcode/Admin1 Mismatch"] = df.loc[dq_flags]
 
-    # --- Data quality: address contains location info conflicting with admin fields ---
     state_abbrevs = {"nsw": "new south wales", "vic": "victoria", "qld": "queensland",
                      "sa": "south australia", "wa": "western australia", "tas": "tasmania",
                      "nt": "northern territory", "act": "australian capital territory"}
@@ -499,17 +456,17 @@ def validate_dataframe(df, skip):
         cc = str(row.get("CountryCode", "")).strip().upper()
         if cc == "AU" and a1:
             for abbr, full in state_abbrevs.items():
-                if (abbr in addr.split() or full in addr) and full != a1.lower():
+                if (abbr in addr.split() or full in addr) and full != a1:
                     conflict_flags.append(idx)
                     break
     if conflict_flags:
-        warnings.append(f"**{len(conflict_flags)}** row(s) have a state/region in the address that conflicts with Admin1Name.")
+        warnings.append(f"**{len(conflict_flags)}** row(s) have address/Admin1 conflict.")
         flagged_rows["Address/Admin1 Conflict"] = df.loc[conflict_flags]
 
     already = int((lat_num.notna() & lng_num.notna()).sum())
     valid_count = int(valid_addr.sum())
     if skip and already == valid_count and valid_count > 0:
-        warnings.append("**Every row already has coordinates** and skip is on. Nothing will be geocoded.")
+        warnings.append("**Every row already has coordinates** and skip is on.")
 
     to_geo = df.loc[valid_addr, "StreetAddress"].nunique()
     if skip:
@@ -527,6 +484,10 @@ def validate_dataframe(df, skip):
     }
 
 
+# =============================================================================
+# GEOCODING
+# =============================================================================
+
 def process_dataframe(df, key, delay_s, skip):
     result = df.copy()
     result["Latitude"] = pd.to_numeric(result["Latitude"], errors="coerce")
@@ -534,7 +495,6 @@ def process_dataframe(df, key, delay_s, skip):
 
     has_addr = result["StreetAddress"].notna() & (result["StreetAddress"].str.strip() != "")
 
-    # Build composite address
     addr_parts = ["StreetAddress", "CityName", "Admin2Name", "Admin1Name", "PostalCode"]
     present_parts = [c for c in addr_parts if c in result.columns]
 
@@ -547,6 +507,7 @@ def process_dataframe(df, key, delay_s, skip):
         return ", ".join(p)
 
     result["_full_addr"] = result.apply(build_addr, axis=1)
+    result["_street_only"] = result["StreetAddress"].fillna("").astype(str).str.strip()
     st.caption(f"Building address from: {', '.join(present_parts)}")
 
     def clean_col(col):
@@ -564,9 +525,6 @@ def process_dataframe(df, key, delay_s, skip):
 
     needs = (has_addr & (result["Latitude"].isna() | result["Longitude"].isna())) if skip else has_addr
 
-    # Also need raw street address for address-only fallback
-    result["_street_only"] = result["StreetAddress"].fillna("").astype(str).str.strip()
-
     constraint_cols = ["_full_addr", "_street_only", "_cc", "_city", "_admin1", "_admin2", "_postal"]
     geo_sub = result.loc[needs, constraint_cols].copy()
     geo_sub = geo_sub[geo_sub["_full_addr"].str.strip() != ""]
@@ -575,7 +533,7 @@ def process_dataframe(df, key, delay_s, skip):
 
     if total == 0:
         st.info("Nothing to geocode.")
-        return result.drop(columns=["_full_addr", "_cc", "_city", "_admin1", "_admin2", "_postal"]), None
+        return result.drop(columns=["_full_addr", "_street_only", "_cc", "_city", "_admin1", "_admin2", "_postal"]), None
 
     sample_addrs = [combo[0] for combo in combos[:5]]
     with st.expander("🔍 Sample addresses being sent to Google"):
@@ -586,7 +544,7 @@ def process_dataframe(df, key, delay_s, skip):
         test = single_geocode_call("10 Downing Street, London, UK", key)
         if test["status"] == "REQUEST_DENIED":
             st.error("❌ API key rejected.")
-            return result.drop(columns=["_full_addr", "_cc", "_city", "_admin1", "_admin2", "_postal"]), None
+            return result.drop(columns=["_full_addr", "_street_only", "_cc", "_city", "_admin1", "_admin2", "_postal"]), None
 
     prog = st.progress(0, text="Starting…")
     status_area = st.empty()
@@ -617,8 +575,7 @@ def process_dataframe(df, key, delay_s, skip):
                 time.sleep(delay_s)
 
         if geo["status"] != "OK":
-            errs.append({"FullAddress": addr, "StreetAddress": street,
-                         "CountryCode": cc or "(none)",
+            errs.append({"FullAddress": addr, "StreetAddress": street, "CountryCode": cc or "(none)",
                          "City": city or "(none)", "Admin1": admin1 or "(none)",
                          "Status": geo["status"], "Detail": geo.get("detail", "")})
             consec += 1
@@ -629,13 +586,11 @@ def process_dataframe(df, key, delay_s, skip):
             consec = 0
             if geo.get("fallback"):
                 fallbacks.append({"FullAddress": addr, "StreetAddress": street,
-                                  "City": city or "(none)",
-                                  "Admin1": admin1 or "(none)", "Method": geo.get("method", ""),
-                                  "Detail": geo.get("detail", "")})
+                                  "City": city or "(none)", "Admin1": admin1 or "(none)",
+                                  "Method": geo.get("method", ""), "Detail": geo.get("detail", "")})
 
     prog.progress(1.0, text="Done!")
 
-    # Apply results
     result["GoogleLocationType"] = ""
     result["GeoMethod"] = ""
     result["AddrOnlyBetter"] = False
@@ -666,7 +621,7 @@ def process_dataframe(df, key, delay_s, skip):
         with st.expander(f"⚠️ {fail} failed — click for details"):
             st.dataframe(pd.DataFrame(errs), use_container_width=True)
 
-    result = result.drop(columns=["_cc", "_full_addr", "_city", "_admin1", "_admin2", "_postal", "_street_only"])
+    result = result.drop(columns=["_cc", "_full_addr", "_street_only", "_city", "_admin1", "_admin2", "_postal"])
 
     # Comparison report
     comp = None
@@ -696,7 +651,7 @@ def process_dataframe(df, key, delay_s, skip):
                                                            float(r["New_Latitude"]), float(r["New_Longitude"])), 2))
                         else:
                             dists.append(None)
-                    except:
+                    except Exception:
                         dists.append(None)
                 comp["Distance_m"] = dists
         except Exception as e:
@@ -705,11 +660,11 @@ def process_dataframe(df, key, delay_s, skip):
     return result, comp
 
 
-def build_recommendations(result_df, comparison_df=None):
-    """Build a recommendations dataframe from geocoded results.
-    If comparison_df is provided, use distance to flag large discrepancies."""
+# =============================================================================
+# RECOMMENDATIONS
+# =============================================================================
 
-    # Build a distance lookup from comparison report
+def build_recommendations(result_df, comparison_df=None, has_tiv=False, total_tiv=0):
     distance_lookup = {}
     if comparison_df is not None and len(comparison_df) > 0:
         for _, row in comparison_df.iterrows():
@@ -728,106 +683,103 @@ def build_recommendations(result_df, comparison_df=None):
         lat = row.get("Latitude")
         lng = row.get("Longitude")
 
-        # Check distance from original if available
+        # TIV info
+        tiv = float(row.get("_TIV", 0)) if has_tiv and pd.notna(row.get("_TIV")) else None
+        pct = (tiv / total_tiv * 100) if tiv and total_tiv > 0 else None
+        tiv_note = ""
+        if tiv and tiv > 0:
+            tiv_note = f" Location TIV: {tiv:,.0f} ({pct:.2f}% of portfolio)."
+
+        # Distance info
         dist_m = distance_lookup.get(addr_id)
         dist_km = dist_m / 1000 if dist_m is not None else None
 
-        # Distance flags override other categories
         distance_flag = None
         distance_note = ""
         if dist_km is not None:
             if dist_km >= 50:
                 distance_flag = "red"
                 distance_note = (f" Distance from original: {dist_km:,.1f}km — "
-                                 "large discrepancy detected. Either the street address, "
-                                 "admin fields, or original coordinates may be incorrect. "
-                                 "High priority investigation required.")
+                                 "large discrepancy. High priority investigation required.")
             elif dist_km >= 5:
                 distance_flag = "orange"
                 distance_note = (f" Distance from original: {dist_km:,.1f}km — "
-                                 "notable difference from original coordinates. "
-                                 "Worth investigating to determine which source is more accurate.")
+                                 "notable difference. Worth investigating.")
+
+        # Build recommendation based on category
+        rec_entry = {"AddressID": addr_id, "StreetAddress": street,
+                     "GoogleLocationType": loc_type, "GeoMethod": method,
+                     "Distance_km": dist_km, "TIV": tiv, "TIV_Pct": pct}
 
         if pd.isna(lat) or pd.isna(lng) or loc_type == "":
-            recs.append({"AddressID": addr_id, "StreetAddress": street,
-                         "GoogleLocationType": loc_type, "GeoMethod": method,
-                         "Distance_km": dist_km,
-                         "Category": "❌ Failed", "Priority": 1,
-                         "Recommendation": "Geocoding failed entirely — all attempts exhausted. Manual geocoding required. "
-                         "Check both the street address and admin fields for errors."})
+            rec_entry.update({
+                "Category": "❌ Failed", "Priority": 1,
+                "Recommendation": "Geocoding failed — all attempts exhausted. Manual geocoding required. "
+                "Check both the street address and admin fields." + tiv_note
+            })
+            recs.append(rec_entry)
         elif distance_flag == "red":
-            # Red distance flag overrides everything — even ROOFTOP
-            cat = "🔴 Large coordinate discrepancy"
-            rec_text = (f"Google returned {loc_type} via {method}, but coordinates are {dist_km:,.1f}km "
-                        "from the original. This is a significant discrepancy that requires investigation. "
-                        "Possible causes: (1) street address is wrong or ambiguous and matched a different location, "
-                        "(2) admin fields were incorrect causing a wrong match, "
-                        "(3) original coordinates were wrong and Google is actually correct. "
-                        "Manually verify which coordinates are right.")
-            recs.append({"AddressID": addr_id, "StreetAddress": street,
-                         "GoogleLocationType": loc_type, "GeoMethod": method,
-                         "Distance_km": dist_km,
-                         "Category": cat, "Priority": 1,
-                         "Recommendation": rec_text})
+            rec_entry.update({
+                "Category": "🔴 Large coordinate discrepancy", "Priority": 1,
+                "Recommendation": f"Google returned {loc_type} via {method}, but coordinates are {dist_km:,.1f}km "
+                "from the original. Significant discrepancy — manually verify which coordinates are correct. "
+                "Possible causes: wrong street address, incorrect admin fields, or wrong original coordinates." + tiv_note
+            })
+            recs.append(rec_entry)
         elif distance_flag == "orange":
-            cat = "🟠 Notable coordinate difference"
-            rec_text = (f"Google returned {loc_type} via {method}, but coordinates are {dist_km:,.1f}km "
-                        "from the original. Check whether the new or original coordinates are more accurate.")
+            rec_text = (f"Google returned {loc_type} via {method}, coordinates are {dist_km:,.1f}km "
+                        "from the original. Check which is more accurate.")
             if aob:
-                rec_text += " Address-only search outperformed constrained — admin data may have issues."
-            recs.append({"AddressID": addr_id, "StreetAddress": street,
-                         "GoogleLocationType": loc_type, "GeoMethod": method,
-                         "Distance_km": dist_km,
-                         "Category": cat, "Priority": 3,
-                         "Recommendation": rec_text})
+                rec_text += " Address-only outperformed constrained — admin data may have issues."
+            rec_entry.update({
+                "Category": "🟠 Notable coordinate difference", "Priority": 3,
+                "Recommendation": rec_text + tiv_note
+            })
+            recs.append(rec_entry)
         elif loc_type == "APPROXIMATE":
-            recs.append({"AddressID": addr_id, "StreetAddress": street,
-                         "GoogleLocationType": loc_type, "GeoMethod": method,
-                         "Distance_km": dist_km,
-                         "Category": "🔴 Very low precision", "Priority": 2,
-                         "Recommendation": "Approximate location only (admin/region level) — best result across all attempts. "
-                         "Not suitable for cat modelling. Manual check required. "
-                         "Verify the street address is correct and complete." + distance_note})
-        elif loc_type == "GEOMETRIC_CENTER":
-            rec_text = ("Centroid of postal code or city area — best result across all attempts. "
-                        "Acceptable for DLM but not HD models. Manual check recommended.")
-            if method in ("constrained", "constrained_no_city", "country_only"):
-                rec_text += " The constrained result was preferred — verify the street address exists."
-            recs.append({"AddressID": addr_id, "StreetAddress": street,
-                         "GoogleLocationType": loc_type, "GeoMethod": method,
-                         "Distance_km": dist_km,
-                         "Category": "🟠 Low precision", "Priority": 3,
-                         "Recommendation": rec_text + distance_note})
-        elif loc_type == "RANGE_INTERPOLATED":
-            rec_text = "Interpolated street position — not rooftop level."
+            rec_entry.update({
+                "Category": "🔴 Very low precision", "Priority": 2,
+                "Recommendation": "Approximate location only (admin/region level) — best result across all attempts. "
+                "Not suitable for cat modelling. Manual check required. "
+                "Verify the street address is correct and complete." + distance_note + tiv_note
+            })
+            recs.append(rec_entry)
+        elif loc_type in ("GEOMETRIC_CENTER", "RANGE_INTERPOLATED"):
+            if loc_type == "GEOMETRIC_CENTER":
+                rec_text = ("Coordinates are in the correct area but not confirmed at rooftop level. "
+                            "May represent the correct building or a nearby point on the same street.")
+            else:
+                rec_text = ("Interpolated street position — Google estimated the location along the street "
+                            "but could not confirm the exact building.")
+            if method in ("constrained", "constrained_no_city", "country_only") and loc_type == "GEOMETRIC_CENTER":
+                rec_text += " Constrained result preferred — verify the street address exists."
             if aob:
                 rec_text += " Address-only outperformed constrained — admin data may be incorrect."
-            if method != "constrained":
+            elif method != "constrained" and method:
                 rec_text += f" Resolved via {method}."
-            rec_text += " Review if high-value location."
-            recs.append({"AddressID": addr_id, "StreetAddress": street,
-                         "GoogleLocationType": loc_type, "GeoMethod": method,
-                         "Distance_km": dist_km,
-                         "Category": "🟡 Below rooftop", "Priority": 4,
-                         "Recommendation": rec_text + distance_note})
+            rec_text += " Worth verifying for high-value locations."
+            rec_entry.update({
+                "Category": "🟡 Below rooftop", "Priority": 4,
+                "Recommendation": rec_text + distance_note + tiv_note
+            })
+            recs.append(rec_entry)
         elif loc_type == "ROOFTOP" and aob:
-            recs.append({"AddressID": addr_id, "StreetAddress": street,
-                         "GoogleLocationType": loc_type, "GeoMethod": method,
-                         "Distance_km": dist_km,
-                         "Category": "🟢 Rooftop (data quality flag)", "Priority": 5,
-                         "Recommendation": "Rooftop precision achieved, but address-only outperformed constrained — "
-                         "admin fields likely have data quality issues. Coordinates are good, but review admin data." + distance_note})
+            rec_entry.update({
+                "Category": "🟢 Rooftop (data quality flag)", "Priority": 5,
+                "Recommendation": "Rooftop precision achieved, but address-only outperformed constrained — "
+                "admin fields likely have data quality issues. Coordinates are good, but review admin data." + distance_note + tiv_note
+            })
+            recs.append(rec_entry)
         elif loc_type == "ROOFTOP" and method != "constrained":
-            recs.append({"AddressID": addr_id, "StreetAddress": street,
-                         "GoogleLocationType": loc_type, "GeoMethod": method,
-                         "Distance_km": dist_km,
-                         "Category": "🟢 Rooftop (relaxed constraints)", "Priority": 5,
-                         "Recommendation": f"Rooftop precision via {method}. Coordinates are good but admin data may need correction." + distance_note})
-        # ROOFTOP + constrained + no flags + no distance flag = perfect, skip
+            rec_entry.update({
+                "Category": "🟢 Rooftop (relaxed constraints)", "Priority": 5,
+                "Recommendation": f"Rooftop precision via {method}. Coordinates are good but admin data may need correction." + distance_note + tiv_note
+            })
+            recs.append(rec_entry)
+        # ROOFTOP + constrained + no flags = perfect, skip
 
     if not recs:
         return None
-
     rec_df = pd.DataFrame(recs)
     rec_df = rec_df.sort_values("Priority").reset_index(drop=True)
     return rec_df
@@ -845,7 +797,6 @@ if uploaded:
         st.error(err)
         st.stop()
 
-    # Step 1: Header row
     st.subheader("Step 1: Select the header row")
     st.markdown("Pick the row that contains your column names.")
     preview = min(15, len(raw_df))
@@ -862,40 +813,85 @@ if uploaded:
 
     # Step 2: Column mapping
     st.subheader("Step 2: Map your columns")
+
+    # Template presets
+    TEMPLATES = {
+        "Custom (map everything manually)": {
+            "fields": ALL_FIELDS,
+            "description": "Full control — map each field yourself."
+        },
+        "Terrorism 4020": {
+            "fields": ["StreetAddress", "CityName", "PostalCode", "CountryCode"],
+            "description": "StreetAddress, CityName, PostalCode, CountryCode → returns Lat/Lng + quality."
+        },
+        "Full RiskLink export": {
+            "fields": [OPTIONAL_ID, "StreetAddress", "Latitude", "Longitude",
+                       "CityName", "Admin2Name", "Admin1Name", "PostalCode", "CountryCode"],
+            "description": "All fields including AddressID, coordinates, and admin levels."
+        },
+        "Coordinates only (re-geocode)": {
+            "fields": ["StreetAddress", "Latitude", "Longitude", "CountryCode"],
+            "description": "Re-geocode existing data — StreetAddress + existing coords + country."
+        },
+        "Minimal (street address only)": {
+            "fields": ["StreetAddress"],
+            "description": "Just the street address — geocode with no constraints."
+        },
+    }
+
+    template = st.selectbox("Template", list(TEMPLATES.keys()), index=0,
+                            help="Pick a preset to show only the fields your team uses, or choose Custom for full control.")
+    st.caption(TEMPLATES[template]["description"])
+
+    active_fields = TEMPLATES[template]["fields"]
+
     st.markdown("Match each field to a column from your file.")
     opts = [UNMAPPED] + avail
     mapping = {}
 
-    st.markdown("**Core fields:**")
-    c1, c2, c3, c4 = st.columns(4)
-    for col_ui, field in zip([c1, c2, c3, c4], CORE_FIELDS):
-        idx = opts.index(guess_column(field, avail)) if guess_column(field, avail) in opts else 0
-        with col_ui:
-            mapping[field] = st.selectbox(field, opts, idx, key=f"m_{field}")
+    # Always map active fields
+    # Group them into rows of 3-4
+    field_groups = [active_fields[i:i+4] for i in range(0, len(active_fields), 4)]
+    for group in field_groups:
+        cols = st.columns(len(group))
+        for col_ui, field in zip(cols, group):
+            idx = opts.index(guess_column(field, avail)) if guess_column(field, avail) in opts else 0
+            with col_ui:
+                label = f"{field}" if field in CORE_FIELDS else f"{field} (opt)"
+                mapping[field] = st.selectbox(label, opts, idx, key=f"m_{field}")
 
-    st.markdown("**Location fields:**")
-    l1, l2, l3 = st.columns(3)
-    for col_ui, field in zip([l1, l2, l3], LOCATION_FIELDS[:3]):
-        idx = opts.index(guess_column(field, avail)) if guess_column(field, avail) in opts else 0
-        with col_ui:
-            mapping[field] = st.selectbox(field, opts, idx, key=f"m_{field}")
-    l4, l5, _ = st.columns(3)
-    for col_ui, field in zip([l4, l5], LOCATION_FIELDS[3:]):
-        idx = opts.index(guess_column(field, avail)) if guess_column(field, avail) in opts else 0
-        with col_ui:
-            mapping[field] = st.selectbox(field, opts, idx, key=f"m_{field}")
+    # Set unmapped for fields not in the active template
+    for field in ALL_FIELDS:
+        if field not in mapping:
+            mapping[field] = UNMAPPED
+
+    st.markdown("**Value fields (optional — for TIV context in recommendations):**")
+    st.caption("Select columns with insured values. They will be summed into a Total Insured Value per row.")
+    value_columns = st.multiselect("Value columns", options=avail, default=[], key="m_values")
 
     st.markdown("**Your column mappings:**")
     lines = []
     for f in ALL_FIELDS:
         s = mapping.get(f, UNMAPPED)
         lines.append(f"- **{f}** ← `{s}`" if s != UNMAPPED else f"- **{f}** ← *(not mapped)*")
+    if value_columns:
+        lines.append(f"- **TIV** ← `{', '.join(value_columns)}`")
     st.markdown("\n".join(lines))
 
-    unmapped = [f for f in ALL_FIELDS if mapping.get(f) == UNMAPPED]
-    if unmapped:
-        st.warning(f"Fields not mapped: **{', '.join(unmapped)}**.")
+    if mapping.get("StreetAddress") == UNMAPPED:
+        st.warning("**StreetAddress** must be mapped to continue.")
         st.stop()
+
+    mapped_optional = [f for f in LOCATION_FIELDS if mapping.get(f) != UNMAPPED]
+    has_id = mapping.get(OPTIONAL_ID) != UNMAPPED
+    has_coords = mapping.get("Latitude") != UNMAPPED and mapping.get("Longitude") != UNMAPPED
+
+    if not mapped_optional:
+        st.info("ℹ️ No location fields mapped — geocoding will rely on the street address alone.")
+    if not has_id:
+        st.info("ℹ️ No AddressID mapped — row numbers will be used as identifiers.")
+    if not has_coords:
+        st.info("ℹ️ No Latitude/Longitude mapped — all rows will be geocoded.")
 
     mapped_vals = [c for c in mapping.values() if c != UNMAPPED]
     if len(mapped_vals) != len(set(mapped_vals)):
@@ -906,6 +902,22 @@ if uploaded:
         st.stop()
 
     df_m = df_h.copy().rename(columns={v: k for k, v in mapping.items() if v != UNMAPPED})
+    for field in LOCATION_FIELDS:
+        if field not in df_m.columns:
+            df_m[field] = ""
+    if "AddressID" not in df_m.columns:
+        df_m["AddressID"] = [f"ROW_{i+1}" for i in range(len(df_m))]
+    for field in COORD_FIELDS:
+        if field not in df_m.columns:
+            df_m[field] = ""
+
+    if value_columns:
+        df_m["_TIV"] = 0.0
+        for vc in value_columns:
+            if vc in df_m.columns:
+                df_m["_TIV"] += pd.to_numeric(df_m[vc], errors="coerce").fillna(0)
+        total_portfolio_tiv = df_m["_TIV"].sum()
+        st.caption(f"Total portfolio value: **{total_portfolio_tiv:,.0f}** across {len(value_columns)} value column(s).")
 
     st.subheader("Mapped data preview (first 10 rows)")
     st.dataframe(df_m.head(10), use_container_width=True)
@@ -982,24 +994,44 @@ if uploaded:
                                              tooltip=tip, map_provider="carto", map_style="light"))
 
                 # Recommendations
-                rec_df = build_recommendations(res_df, comp_df)
+                has_tiv = "_TIV" in res_df.columns
+                total_tiv = res_df["_TIV"].sum() if has_tiv else 0
+                rec_df = build_recommendations(res_df, comp_df, has_tiv=has_tiv, total_tiv=total_tiv)
+
                 if rec_df is not None and len(rec_df) > 0:
                     st.subheader("Step 5: Recommendations")
-                    st.markdown(
-                        "Based on geocoding quality, the following rows need attention. "
-                        "Rows with ROOFTOP precision via the constrained method are not listed — those are good."
-                    )
 
-                    # Summary counts
+                    # Show clean TIV summary first
+                    if has_tiv and total_tiv > 0:
+                        flagged_tiv = rec_df["TIV"].fillna(0).sum()
+                        clean_tiv = total_tiv - flagged_tiv
+                        clean_pct = clean_tiv / total_tiv * 100
+                        st.markdown(
+                            f"**{clean_pct:.1f}%** of portfolio TIV (**{clean_tiv:,.0f}** of {total_tiv:,.0f}) "
+                            f"geocoded to ROOFTOP with no flags — no action needed on those."
+                        )
+
+                    st.markdown(
+                        "The following rows need attention. "
+                        "Rows with ROOFTOP precision via the constrained method are not listed."
+                    )
                     cat_counts = rec_df["Category"].value_counts()
                     for cat in sorted(cat_counts.index, key=lambda x: rec_df.loc[rec_df["Category"] == x, "Priority"].iloc[0]):
-                        st.markdown(f"- {cat}: **{cat_counts[cat]}** row(s)")
+                        cat_tiv = ""
+                        if has_tiv and "TIV" in rec_df.columns:
+                            cat_total = rec_df.loc[rec_df["Category"] == cat, "TIV"].fillna(0).sum()
+                            if cat_total > 0:
+                                cat_pct = cat_total / total_tiv * 100 if total_tiv > 0 else 0
+                                cat_tiv = f" — TIV: {cat_total:,.0f} ({cat_pct:.1f}% of portfolio)"
+                        st.markdown(f"- {cat}: **{cat_counts[cat]}** row(s){cat_tiv}")
 
-                    st.dataframe(rec_df.drop(columns=["Priority"]), use_container_width=True)
-                    st.download_button("📥 Download recommendations CSV", rec_df.drop(columns=["Priority"]).to_csv(index=False),
+                    display_cols = [c for c in rec_df.columns if c != "Priority"]
+                    st.dataframe(rec_df[display_cols], use_container_width=True)
+                    st.download_button("📥 Download recommendations CSV",
+                                       rec_df[display_cols].to_csv(index=False),
                                        "geocode_recommendations.csv", "text/csv", key="dl_rec")
                 else:
-                    st.success("🎉 All addresses geocoded at ROOFTOP precision with full constraints — no recommendations needed!")
+                    st.success("🎉 All addresses geocoded at ROOFTOP precision — no recommendations needed!")
 
                 # Comparison report
                 if not skip_existing:
@@ -1019,7 +1051,7 @@ else:
         1. Paste your **Google Geocoding API key** in the sidebar.
         2. Upload a file — CSV, Excel (.xlsx / .xls), or delimited text (.txt / .tsv).
         3. **Select the header row** — pick which row contains your column names.
-        4. **Map your columns** — match your file's columns to: `AddressID`, `StreetAddress`, `Latitude`, `Longitude`, `CityName`, `Admin2Name`, `Admin1Name`, `PostalCode`, `CountryCode`.
+        4. **Map your columns** — only `StreetAddress` is required. Optionally map `Latitude`/`Longitude`, `AddressID`, location fields, and value columns for richer output.
         5. Review the **validation report** and fix any issues if needed.
         6. Click **Geocode** — the app uses a two-pass strategy (constrained then address-only) and deduplicates to minimise API calls.
         7. Review the **recommendations** for any rows that need manual attention.
