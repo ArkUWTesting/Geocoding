@@ -1,0 +1,58 @@
+name: Keep Streamlit Awake
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+      timezone: "Europe/London"
+
+  # Lets you test it manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  visit-streamlit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "lts/*"
+
+      - name: Install Playwright
+        run: |
+          npm install playwright
+          npx playwright install chromium --with-deps
+
+      - name: Open Streamlit app
+        env:
+          APP_URL: "https://ark-geocoding.streamlit.app/"
+        run: |
+          node <<'EOF'
+          const { chromium } = require('playwright');
+
+          (async () => {
+            const browser = await chromium.launch({ headless: true });
+            const page = await browser.newPage();
+
+            console.log(`Opening ${process.env.APP_URL}`);
+
+            const response = await page.goto(process.env.APP_URL, {
+              waitUntil: 'domcontentloaded',
+              timeout: 180000
+            });
+
+            console.log(`HTTP status: ${response?.status()}`);
+            console.log(`Page title: ${await page.title()}`);
+
+            // Leave the browser connected for a while so Streamlit
+            // has time to initialise a real session.
+            await page.waitForTimeout(30000);
+
+            await browser.close();
+            console.log("Done.");
+          })().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          EOF
