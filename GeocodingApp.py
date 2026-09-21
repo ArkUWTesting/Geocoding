@@ -5,81 +5,104 @@ import time
 import math
 import re
 import threading
+import hashlib
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pydeck as pdk
 
-st.set_page_config(page_title="Batch Geocoder", page_icon="🌍", layout="wide")
-st.title("🌍 Batch Geocoder")
-st.markdown("Upload a file, geocode addresses using Google's Geocoding API, and download the results.")
-
-# Sidebar
-st.sidebar.header("Configuration")
-api_key = st.sidebar.text_input("Google Geocoding API Key", type="password",
-                                 help="Paste your API key here. It is not stored anywhere.")
-if not api_key:
-    st.sidebar.warning("Please enter your API key to enable geocoding.")
-
-st.sidebar.header("Settings")
-skip_existing = st.sidebar.checkbox("Skip rows that already have valid coordinates", value=True)
+st.set_page_config(page_title="Ark Batch Geocoder", page_icon="G", layout="wide")
+st.title("Ark Batch Geocoder")
+st.caption("Fast batch geocoding with progressive geographic fallbacks, explicit quality levels, and auditable failure reasons.")
+st.caption(f"Build {APP_VERSION}")
 
 # Ark Google Cloud project quota: 6,000 Geocoding v3 requests/minute.
-# The user controls the per-run QPM target. The hard project ceiling is still shared globally.
 GOOGLE_QPM_QUOTA = 6000
 GOOGLE_QPM_DEFAULT = 5400
+APP_VERSION = "v5-progressive-fallbacks"
 
-target_qpm = st.sidebar.slider(
-    "Google requests per minute", 300, GOOGLE_QPM_QUOTA, GOOGLE_QPM_DEFAULT, 100,
-    help=(
-        f"Ark's approved Geocoding v3 quota is {GOOGLE_QPM_QUOTA:,} requests/minute. "
-        "This controls actual outbound Google requests, including retries and fallbacks. "
-        "You can select the full 6,000 for maximum throughput, but running exactly at the project ceiling "
-        "can still produce occasional OVER_QUERY_LIMIT responses around quota-window boundaries."
-    )
+# Session state
+for key, default in {
+    "_geocode_cache": {},
+    "_confirm_clear": False,
+    "_last_geocode_results": None,
+    "_last_geocode_comparison": None,
+    "_last_geocode_skip_existing": True,
+    "_last_input_signature": None,
+    "_active_file_signature": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+st.sidebar.header("Google API")
+api_key = st.sidebar.text_input(
+    "Geocoding API key", type="password",
+    help="Used only for this Streamlit session. The app does not write the key to disk."
 )
-max_workers = st.sidebar.slider(
-    "Concurrent workers", 8, 128, 96, 8,
+if api_key:
+    st.sidebar.success("API key entered")
+else:
+    st.sidebar.warning("Enter an API key before starting a run.")
+
+st.sidebar.header("Processing")
+skip_existing = st.sidebar.checkbox(
+    "Keep valid existing coordinates", value=True,
+    help="Rows with a valid latitude/longitude pair are left unchanged. Invalid or incomplete coordinates are geocoded again."
+)
+target_qpm = st.sidebar.slider(
+    "Google queries per minute", 300, GOOGLE_QPM_QUOTA, GOOGLE_QPM_DEFAULT, 100,
     help=(
-        "Number of address jobs processed concurrently. Workers do not bypass the QPM limiter; "
-        "they simply keep requests ready while other workers wait for Google responses."
+        f"Ark's approved Geocoding v3 quota is {GOOGLE_QPM_QUOTA:,} queries/minute. "
+        "This is a rolling 60-second limit across primary searches, fallbacks, and retries. "
+        "Selecting the full quota maximises speed but leaves no headroom for quota-window differences."
     )
 )
 st.sidebar.caption(
-    f"Approved Geocoding v3 quota: {GOOGLE_QPM_QUOTA:,}/min. "
-    f"Current run target: {target_qpm:,}/min (~{target_qpm / 60:.1f}/sec average)."
+    f"Run ceiling: {target_qpm:,}/min. Project ceiling: {GOOGLE_QPM_QUOTA:,}/min."
 )
+if target_qpm >= GOOGLE_QPM_QUOTA:
+    st.sidebar.warning("Full quota selected: fastest possible setting, but any Google quota-window jitter can cause temporary OVER_QUERY_LIMIT responses. The app will back off and retry automatically.")
+elif target_qpm >= 5700:
+    st.sidebar.info("Near-full quota selected. This is fast and still leaves a small amount of headroom.")
 
-st.sidebar.header("Cache")
-if "_geocode_cache" not in st.session_state:
-    st.session_state["_geocode_cache"] = {}
-if "_confirm_clear" not in st.session_state:
-    st.session_state["_confirm_clear"] = False
-if "_last_geocode_results" not in st.session_state:
-    st.session_state["_last_geocode_results"] = None
-if "_last_geocode_comparison" not in st.session_state:
-    st.session_state["_last_geocode_comparison"] = None
-if "_last_geocode_skip_existing" not in st.session_state:
-    st.session_state["_last_geocode_skip_existing"] = True
+with st.sidebar.expander("Fallback policy", expanded=True):
+    st.caption("Fallbacks run only for unresolved locations and are deduplicated across the file.")
+    fallback_postal = st.checkbox("Use postcode / ZIP centroids", value=True)
+    fallback_city = st.checkbox("Use city centroids", value=True)
+    fallback_admin = st.checkbox("Use county/state/region centroids", value=True)
+    fallback_country = st.checkbox(
+        "Use country centroids as a last resort", value=False,
+        help="Usually too coarse for catastrophe modelling and risky when source country codes are unreliable."
+    )
 
-cache_display = st.sidebar.empty()
-cache_display.caption(f"**{len(st.session_state['_geocode_cache'])}** addresses cached this session.")
+with st.sidebar.expander("Advanced performance", expanded=False):
+    max_workers = st.slider(
+        "Concurrent workers", 8, 160, 96, 8,
+        help=(
+            "How many location jobs can be in progress at once. Workers share the same rolling QPM limiter, "
+            "so increasing this does not bypass the Google quota."
+        )
+    )
+    st.caption("96 workers is a sensible starting point for a 6,000-QPM project quota.")
 
-if not st.session_state["_confirm_clear"]:
-    if st.sidebar.button("🗑️ Clear cache"):
-        st.session_state["_confirm_clear"] = True
-        st.rerun()
-else:
-    st.sidebar.warning("Are you sure? This cannot be undone.")
-    col_yes, col_no = st.sidebar.columns(2)
-    with col_yes:
-        if st.button("Yes, clear", type="primary"):
-            st.session_state["_geocode_cache"] = {}
-            st.session_state["_confirm_clear"] = False
+with st.sidebar.expander("Session cache", expanded=False):
+    cache_display = st.empty()
+    cache_display.caption(f"{len(st.session_state['_geocode_cache']):,} successful lookups cached in this session.")
+    if not st.session_state["_confirm_clear"]:
+        if st.button("Clear session cache", key="clear_cache_btn"):
+            st.session_state["_confirm_clear"] = True
             st.rerun()
-    with col_no:
-        if st.button("Cancel"):
-            st.session_state["_confirm_clear"] = False
-            st.rerun()
+    else:
+        st.warning("Clear all cached geocodes from this Streamlit session?")
+        c_yes, c_no = st.columns(2)
+        with c_yes:
+            if st.button("Clear", type="primary", key="confirm_clear_cache"):
+                st.session_state["_geocode_cache"] = {}
+                st.session_state["_confirm_clear"] = False
+                st.rerun()
+        with c_no:
+            if st.button("Cancel", key="cancel_clear_cache"):
+                st.session_state["_confirm_clear"] = False
+                st.rerun()
 
 CORE_FIELDS = ["StreetAddress"]
 COORD_FIELDS = ["Latitude", "Longitude"]
@@ -96,7 +119,7 @@ AU_POSTCODE_STATE = {
 
 LOCATION_TYPE_RANK = {"ROOFTOP": 4, "RANGE_INTERPOLATED": 3, "GEOMETRIC_CENTER": 2, "APPROXIMATE": 1}
 
-CACHE_VERSION = "v3-rolling-qpm"
+CACHE_VERSION = "v5-progressive-centroids"
 _thread_local = threading.local()
 
 
@@ -255,6 +278,21 @@ def result_component(result, comp_type):
             return comp.get("long_name", ""), comp.get("short_name", "")
     return "", ""
 
+def result_component_any(result, comp_types):
+    for comp_type in comp_types:
+        long_name, short_name = result_component(result, comp_type)
+        if long_name or short_name:
+            return long_name, short_name
+    return "", ""
+
+
+def text_equivalent(a, b):
+    a = re.sub(r"[^a-z0-9]+", " ", clean_text(a).casefold()).strip()
+    b = re.sub(r"[^a-z0-9]+", " ", clean_text(b).casefold()).strip()
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
+
 
 def postal_equivalent(a, b):
     a, b = clean_text(a).replace(" ", "").upper(), clean_text(b).replace(" ", "").upper()
@@ -276,47 +314,36 @@ def haversine_m(lat1, lon1, lat2, lon2):
 
 
 def score_result_against_constraints(result, country_code=None, admin1=None, admin2=None, city=None, postal_code=None):
+    """Score only genuine returned component matches; missing Google components never count as matches."""
     score = 0
-    components = result.get("address_components", [])
-    def get_comp(comp_type):
-        for c in components:
-            if comp_type in c.get("types", []):
-                return c.get("long_name", "").lower(), c.get("short_name", "").lower()
-        return "", ""
     if country_code:
-        _, short = get_comp("country")
-        if short == country_code.lower():
+        _, short = result_component(result, "country")
+        if short and short.casefold() == clean_text(country_code).casefold():
             score += 10
     if admin1:
-        ln, sn = get_comp("administrative_area_level_1")
-        a1 = admin1.lower()
-        if a1 == ln or a1 == sn or ln in a1 or a1 in ln:
+        long_name, short_name = result_component(result, "administrative_area_level_1")
+        if (long_name and text_equivalent(admin1, long_name)) or (short_name and text_equivalent(admin1, short_name)):
             score += 5
     if admin2:
-        ln, sn = get_comp("administrative_area_level_2")
-        a2 = admin2.lower()
-        if a2 == ln or a2 == sn or ln in a2 or a2 in ln:
+        long_name, short_name = result_component(result, "administrative_area_level_2")
+        if (long_name and text_equivalent(admin2, long_name)) or (short_name and text_equivalent(admin2, short_name)):
             score += 3
     if city:
-        ln, sn = get_comp("locality")
-        ct = city.lower()
-        if ct == ln or ct == sn or ln in ct or ct in ln:
+        long_name, short_name = result_component_any(
+            result, ["locality", "postal_town", "sublocality", "administrative_area_level_3"]
+        )
+        if (long_name and text_equivalent(city, long_name)) or (short_name and text_equivalent(city, short_name)):
             score += 3
     if postal_code:
-        ln, sn = get_comp("postal_code")
-        pc = postal_code.lower()
-        if pc == ln or pc == sn or ln.startswith(pc) or pc.startswith(ln):
+        long_name, short_name = result_component(result, "postal_code")
+        if (long_name and postal_equivalent(postal_code, long_name)) or (short_name and postal_equivalent(postal_code, short_name)):
             score += 4
     return score
 
 
 def single_geocode_call(address, key, components=None, country_code=None, admin1=None,
                         admin2=None, city=None, postal_code=None, limiter=None, retries=4):
-    """One Google geocoding strategy with bounded retries and exact request accounting.
-
-    Every retry passes through the same rolling-QPM limiter. OVER_QUERY_LIMIT triggers a
-    global pause for all workers using this limiter rather than merely sleeping one worker.
-    """
+    """Execute one Google strategy with bounded retries and exact request accounting."""
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     params = {"address": address, "key": key}
     if components:
@@ -332,16 +359,17 @@ def single_geocode_call(address, key, components=None, country_code=None, admin1
         return {
             "lat": None, "lng": None, "status": status, "location_type": None,
             "match_score": 0, "formatted_address": "", "place_id": "",
-            "google_country": "", "google_postal": "", "partial_match": False,
-            "error_message": last_error, "api_calls": request_count,
-            "quota_events": quota_events, "status_history": status_history[:],
+            "google_country": "", "google_postal": "", "google_city": "",
+            "google_admin1": "", "google_admin2": "", "result_types": [],
+            "partial_match": False, "error_message": last_error,
+            "api_calls": request_count, "quota_events": quota_events,
+            "status_history": status_history[:],
         }
 
     for attempt in range(retries + 1):
         if limiter:
             limiter.wait()
         request_count += 1
-
         try:
             resp = _http_session().get(url, params=params, timeout=12)
             resp.raise_for_status()
@@ -367,6 +395,10 @@ def single_geocode_call(address, key, components=None, country_code=None, admin1
                 loc_type = best.get("geometry", {}).get("location_type", "UNKNOWN")
                 _, google_country = result_component(best, "country")
                 google_postal, _ = result_component(best, "postal_code")
+                google_city, _ = result_component_any(
+                    best, ["locality", "postal_town", "sublocality", "administrative_area_level_3"])
+                google_admin1, _ = result_component(best, "administrative_area_level_1")
+                google_admin2, _ = result_component(best, "administrative_area_level_2")
                 return {
                     "lat": loc.get("lat"), "lng": loc.get("lng"), "status": "OK",
                     "location_type": loc_type, "match_score": match_score,
@@ -374,6 +406,10 @@ def single_geocode_call(address, key, components=None, country_code=None, admin1
                     "place_id": best.get("place_id", ""),
                     "google_country": google_country.upper(),
                     "google_postal": google_postal,
+                    "google_city": google_city,
+                    "google_admin1": google_admin1,
+                    "google_admin2": google_admin2,
+                    "result_types": list(best.get("types", [])),
                     "partial_match": bool(best.get("partial_match", False)),
                     "error_message": "", "api_calls": request_count,
                     "quota_events": quota_events, "status_history": status_history[:],
@@ -384,7 +420,6 @@ def single_geocode_call(address, key, components=None, country_code=None, admin1
                 if limiter:
                     limiter.report_over_query_limit()
                 if attempt < retries:
-                    # The limiter owns the global cooldown. The next retry will wait there.
                     continue
                 return failure_payload(status)
 
@@ -392,13 +427,12 @@ def single_geocode_call(address, key, components=None, country_code=None, admin1
                 time.sleep(min(4.0, 0.5 * (2 ** attempt)))
                 continue
 
-            # ZERO_RESULTS, REQUEST_DENIED and INVALID_REQUEST are terminal for this strategy.
             return failure_payload(status)
 
         except requests.Timeout:
-            last_status, last_error = "TIMEOUT", "Google request timed out."
+            last_status, last_error = "TIMEOUT", "Google did not respond within 12 seconds."
         except requests.ConnectionError:
-            last_status, last_error = "CONNECTION_ERROR", "Could not connect to Google."
+            last_status, last_error = "CONNECTION_ERROR", "The app could not connect to Google's Geocoding API."
         except requests.RequestException as exc:
             last_status, last_error = "HTTP_ERROR", str(exc)
         except Exception as exc:
@@ -422,7 +456,103 @@ def _query_parts(*values):
     return ", ".join(parts)
 
 
-def _quality_flags(geo, source_country, source_postal, has_street):
+def infer_granularity(geo, requested="STREET"):
+    types = set(geo.get("result_types") or [])
+    if requested != "STREET":
+        return requested
+    if types & {"street_address", "premise", "subpremise", "route", "establishment", "point_of_interest"}:
+        return "STREET"
+    if "postal_code" in types:
+        return "POSTAL_CODE"
+    if types & {"locality", "postal_town", "sublocality", "administrative_area_level_3"}:
+        return "CITY"
+    if "administrative_area_level_2" in types:
+        return "ADMIN2"
+    if "administrative_area_level_1" in types:
+        return "ADMIN1"
+    if "country" in types:
+        return "COUNTRY"
+    if geo.get("location_type") in {"ROOFTOP", "RANGE_INTERPOLATED"}:
+        return "STREET"
+    return "APPROXIMATE"
+
+def returned_area_granularity(geo):
+    """Describe the level Google actually returned, not the level we hoped to get."""
+    types = set(geo.get("result_types") or [])
+    if "postal_code" in types:
+        return "POSTAL_CODE"
+    if types & {"locality", "postal_town", "sublocality", "administrative_area_level_3"}:
+        return "CITY"
+    if "administrative_area_level_2" in types:
+        return "ADMIN2"
+    if "administrative_area_level_1" in types:
+        return "ADMIN1"
+    if "country" in types:
+        return "COUNTRY"
+    return "APPROXIMATE"
+
+
+def _admin_matches(source_value, google_value):
+    """Missing Google admin components are neutral; an explicit contradiction is not."""
+    source_value = clean_text(source_value)
+    google_value = clean_text(google_value)
+    return not source_value or not google_value or text_equivalent(source_value, google_value)
+
+
+def assess_area_candidate(stage, geo, job):
+    """Return (accepted, actual_granularity, rejection_reason) for an area fallback.
+
+    A query may contain a postcode but Google may only resolve the city. We preserve that
+    distinction rather than overstating precision. Source country remains soft evidence because
+    RMS exports can contain systematically incorrect country codes.
+    """
+    if geo.get("status") != "OK":
+        return False, "", f"Google status {geo.get('status', 'UNKNOWN')}"
+
+    granularity = returned_area_granularity(geo)
+    city_match = text_equivalent(job.get("_city"), geo.get("google_city"))
+    postal_match = postal_equivalent(job.get("_postal"), geo.get("google_postal"))
+    admin2_match = text_equivalent(job.get("_admin2"), geo.get("google_admin2"))
+    admin1_match = text_equivalent(job.get("_admin1"), geo.get("google_admin1"))
+    admin1_consistent = _admin_matches(job.get("_admin1"), geo.get("google_admin1"))
+    admin2_consistent = _admin_matches(job.get("_admin2"), geo.get("google_admin2"))
+
+    if stage == "city_postal":
+        if granularity == "POSTAL_CODE" and postal_match and (not job.get("_city") or not geo.get("google_city") or city_match):
+            return True, "POSTAL_CODE", ""
+        if granularity == "CITY" and city_match and admin1_consistent:
+            return True, "CITY", ""
+        return False, granularity, "Returned area did not consistently match the supplied city/postcode."
+
+    if stage == "postal":
+        if postal_match and (not job.get("_city") or not geo.get("google_city") or city_match) and admin1_consistent:
+            return True, "POSTAL_CODE", ""
+        return False, granularity, "Returned postcode conflicted with the supplied city/state context."
+
+    if stage in {"city_admin1", "city"}:
+        if city_match and admin1_consistent:
+            return True, "CITY", ""
+        return False, granularity, "Returned city conflicted with the supplied city/state context."
+
+    if stage in {"admin2_admin1", "admin2"}:
+        if admin2_match and admin1_consistent:
+            return True, "ADMIN2", ""
+        return False, granularity, "Returned county/district conflicted with the supplied admin context."
+
+    if stage == "admin1":
+        if admin1_match:
+            return True, "ADMIN1", ""
+        return False, granularity, "Returned state/region did not match the supplied value."
+
+    if stage == "country":
+        if clean_text(job.get("_cc")).upper() == clean_text(geo.get("google_country")).upper():
+            return True, "COUNTRY", ""
+        return False, granularity, "Returned country did not match the supplied country code."
+
+    return False, granularity, "Unsupported fallback stage."
+
+
+def _quality_flags(geo, source_country, source_postal, has_street, granularity=None, method=None):
     flags = []
     gc = clean_text(geo.get("google_country")).upper()
     sc = clean_text(source_country).upper()
@@ -438,151 +568,211 @@ def _quality_flags(geo, source_country, source_postal, has_street):
     if geo.get("partial_match"):
         flags.append("Google returned a partial match")
     if not has_street:
-        flags.append("No street address supplied; result is locality/postcode based")
-    if geo.get("location_type") in {"GEOMETRIC_CENTER", "APPROXIMATE"}:
-        flags.append(f"Low precision: {geo.get('location_type')}")
+        flags.append("No street address was supplied")
+    if granularity and granularity not in {"STREET", "EXISTING"}:
+        readable = {
+            "POSTAL_CODE": "postcode/ZIP centroid", "CITY": "city centroid",
+            "ADMIN2": "county/district centroid", "ADMIN1": "state/region centroid",
+            "COUNTRY": "country centroid", "APPROXIMATE": "approximate area point",
+        }.get(granularity, granularity.lower())
+        flags.append(f"Resolved at {readable} level rather than street level")
+    elif geo.get("location_type") in {"GEOMETRIC_CENTER", "APPROXIMATE"}:
+        flags.append(f"Google precision: {geo.get('location_type')}")
+    if method and method not in {"primary", "existing"} and granularity == "STREET":
+        flags.append(f"Street result required {method.replace('_', ' ')} fallback")
     return " | ".join(flags)
 
 
 def geocode_address(full_address, street_address, key, country_code=None, city=None,
                     admin1=None, admin2=None, postal_code=None, limiter=None):
-    """Fast soft-geography strategy.
-
-    Primary search deliberately does NOT hard-constrain source country/admin data. Dirty
-    RMS exports can therefore still resolve. Fallbacks run only for weak/failed results.
-    """
+    """Street-level pass only. Area centroids are handled later in deduplicated batches."""
     full_address = clean_text(full_address)
     street_address = clean_text(street_address)
     city, admin1, admin2, postal_code = map(clean_text, (city, admin1, admin2, postal_code))
     country_code = clean_text(country_code).upper()
 
+    if not street_address:
+        return {
+            "lat": None, "lng": None, "status": "NO_STREET_FOR_PRIMARY", "location_type": None,
+            "method": "primary", "granularity": "", "fallback": False,
+            "detail": "No street address was supplied; area fallbacks will be tried.",
+            "api_calls": 0, "formatted_address": "", "place_id": "", "google_country": "",
+            "google_postal": "", "google_city": "", "google_admin1": "", "google_admin2": "",
+            "result_types": [], "partial_match": False, "quality_flag": "",
+            "error_message": "", "quota_events": 0, "status_history": ["primary:NO_STREET"],
+            "rejected_candidates": 0,
+        }
+
     score_kwargs = {
-        # Source country is intentionally excluded from result scoring. It is audited later.
-        "country_code": None,
+        "country_code": None,  # source country is intentionally soft evidence
         "admin1": admin1 or None,
         "admin2": admin2 or None,
         "city": city or None,
         "postal_code": postal_code or None,
     }
 
+    query_candidates = [
+        ("primary", full_address),
+        ("street_city", _query_parts(street_address, city, admin1)),
+        ("street_postal", _query_parts(street_address, postal_code)),
+        ("street_only", street_address),
+    ]
     queries = []
-    if full_address:
-        queries.append(("primary", full_address))
-
-    # For weak results, drop noisier admin fields while keeping locality/postcode context.
-    compact = _query_parts(street_address, city, postal_code)
-    if compact and compact != full_address:
-        queries.append(("compact", compact))
-    if street_address and street_address not in {q for _, q in queries}:
-        queries.append(("street_only", street_address))
-
-    # Rows without a street are still worth resolving at locality/postcode level.
-    if not street_address:
-        locality = _query_parts(city, admin2, admin1, postal_code)
-        if locality and locality not in {q for _, q in queries}:
-            queries.append(("locality_postcode", locality))
-
-    if not queries:
-        return {
-            "lat": None, "lng": None, "status": "NO_SEARCHABLE_ADDRESS", "location_type": None,
-            "method": "failed", "fallback": False, "detail": "No usable address/geography fields.",
-            "api_calls": 0, "formatted_address": "", "place_id": "", "google_country": "",
-            "google_postal": "", "partial_match": False, "quality_flag": "No searchable address",
-            "error_message": "", "quota_events": 0, "status_history": [],
-        }
+    seen = set()
+    for method, query in query_candidates:
+        query = clean_text(query)
+        if query and query.casefold() not in seen:
+            queries.append((method, query))
+            seen.add(query.casefold())
 
     candidates = []
     api_calls = 0
     quota_events = 0
-    statuses = []
     status_history = []
     last_error = ""
+    statuses = []
 
-    for idx, (method, query) in enumerate(queries):
+    for method, query in queries:
         r = single_geocode_call(query, key, limiter=limiter, **score_kwargs)
-        api_calls += int(r.get("api_calls", 1))
+        api_calls += int(r.get("api_calls", 0))
         quota_events += int(r.get("quota_events", 0))
-        statuses.append(r.get("status", "UNKNOWN"))
-        status_history.extend(r.get("status_history", []))
+        status = r.get("status", "UNKNOWN")
+        statuses.append(status)
+        status_history.extend([f"{method}:{x}" for x in r.get("status_history", [])])
         if r.get("error_message"):
             last_error = r.get("error_message", "")
-        if r.get("status") == "OK":
+        if status == "OK":
+            r["query_used"] = query
             candidates.append((method, r))
-            # Strong first-pass results stop immediately. RANGE_INTERPOLATED is intentionally
-            # accepted as operationally useful; weaker/partial results get one or more fallbacks.
-            if idx == 0 and r.get("location_type") in {"ROOFTOP", "RANGE_INTERPOLATED"} and not r.get("partial_match"):
-                break
-            if method != "primary" and r.get("location_type") == "ROOFTOP" and not r.get("partial_match"):
-                break
-        # If the primary failed, continue. If it succeeded weakly, fallbacks may improve it.
+            if r.get("location_type") in {"ROOFTOP", "RANGE_INTERPOLATED"} and not r.get("partial_match"):
+                # Stop once the street search has produced a strong result consistent with at least
+                # one supplied geography field, or there is no geography context to check against.
+                has_context = bool(city or admin1 or admin2 or postal_code)
+                if not has_context or r.get("match_score", 0) > 0:
+                    break
 
     if not candidates:
-        # Report the final strategy's terminal status. A transient quota response from an earlier
-        # attempt must not turn a later genuine ZERO_RESULTS into a fake quota failure.
-        final_status = statuses[-1] if statuses else "ZERO_RESULTS"
-        detail = diagnose_failure(full_address, city, admin1, admin2, postal_code, country_code)
         return {
-            "lat": None, "lng": None, "status": final_status, "location_type": None,
-            "method": "failed", "fallback": False, "detail": detail, "api_calls": api_calls,
+            "lat": None, "lng": None, "status": statuses[-1] if statuses else "ZERO_RESULTS",
+            "location_type": None, "method": "primary", "granularity": "", "fallback": False,
+            "detail": "Street-level strategies did not resolve the location.", "api_calls": api_calls,
             "formatted_address": "", "place_id": "", "google_country": "", "google_postal": "",
-            "partial_match": False, "quality_flag": "Geocoding failed",
-            "error_message": last_error, "quota_events": quota_events,
-            "status_history": status_history,
+            "google_city": "", "google_admin1": "", "google_admin2": "", "result_types": [],
+            "partial_match": False, "quality_flag": "", "error_message": last_error,
+            "quota_events": quota_events, "status_history": status_history, "rejected_candidates": 0,
         }
 
-    # Prefer geography consistency first, then precision. This prevents a stray rooftop result
-    # from beating a lower-precision result that actually matches the supplied city/postcode.
     best_method, best = max(
         candidates,
         key=lambda item: (item[1].get("match_score", 0), LOCATION_TYPE_RANK.get(item[1].get("location_type"), 0))
     )
-    flag = _quality_flags(best, country_code, postal_code, bool(street_address))
-    detail_parts = []
-    if best_method != "primary":
-        detail_parts.append(f"Resolved via {best_method} fallback.")
-    if flag:
-        detail_parts.append(flag)
+    has_context = bool(city or admin1 or admin2 or postal_code)
+    if has_context and best.get("match_score", 0) <= 0:
+        return {
+            "lat": None, "lng": None, "status": "GEOGRAPHY_MISMATCH", "location_type": None,
+            "method": "primary", "granularity": "", "fallback": False,
+            "detail": "Google returned a street candidate, but it did not match the supplied city/postcode/admin geography, so it was rejected.",
+            "api_calls": api_calls, "formatted_address": best.get("formatted_address", ""),
+            "place_id": best.get("place_id", ""), "google_country": best.get("google_country", ""),
+            "google_postal": best.get("google_postal", ""), "google_city": best.get("google_city", ""),
+            "google_admin1": best.get("google_admin1", ""), "google_admin2": best.get("google_admin2", ""),
+            "result_types": best.get("result_types", []), "partial_match": best.get("partial_match", False),
+            "quality_flag": "Rejected street candidate because geography did not match", "error_message": last_error,
+            "quota_events": quota_events, "status_history": status_history + ["primary:REJECTED_GEOGRAPHY"],
+            "rejected_candidates": 1,
+        }
+
+    granularity = infer_granularity(best, "STREET")
+    flag = _quality_flags(best, country_code, postal_code, True, granularity, best_method)
     return {
         **best,
         "method": best_method,
-        "fallback": best_method != "primary",
+        "granularity": granularity,
+        "fallback": best_method != "primary" or granularity != "STREET",
         "addr_only_better": best_method == "street_only",
-        "detail": " ".join(detail_parts),
+        "detail": f"Resolved using {best_method.replace('_', ' ')} strategy.",
         "quality_flag": flag,
         "api_calls": api_calls,
         "quota_events": quota_events,
         "status_history": status_history,
+        "rejected_candidates": 0,
+        "error_reason": "",
+        "action": (
+            "Use as an area-level result. Correct the source address and rerun if street-level accuracy is required."
+            if granularity != "STREET" else ""
+        ),
     }
 
 
-def diagnose_failure(address, city, admin1, admin2, postal_code, country_code):
-    addr_lower = address.lower() if address else ""
-    reasons = []
-    military = ["hmas", "raaf", "adf", "barracks", "base", "camp", "garrison", "depot", "armoury", "armory"]
-    if any(kw in addr_lower for kw in military):
-        reasons.append("Military/defence facility — Google often can't resolve internal base roads. Manual geocoding recommended.")
-    state_abbrevs = {"nsw": "new south wales", "vic": "victoria", "qld": "queensland",
-                     "sa": "south australia", "wa": "western australia", "tas": "tasmania",
-                     "nt": "northern territory", "act": "australian capital territory"}
-    addr_parts = addr_lower.replace(",", " ").split()
-    embedded_state = None
-    for abbr, full in state_abbrevs.items():
-        if abbr in addr_parts or full in addr_lower:
-            embedded_state = full
-            break
-    if embedded_state and admin1 and embedded_state != admin1.lower():
-        reasons.append(f"Address contains '{embedded_state.title()}' but Admin1 says '{admin1}' — conflicting states.")
-    if city:
-        city_words = set(city.lower().split())
-        if not city_words.intersection(set(addr_parts)) and len(address) > 20:
-            reasons.append(f"CityName '{city}' doesn't appear in the address — possible mismatch.")
-    if city and city.lower().endswith(" city") and country_code and country_code.upper() == "AU":
-        reasons.append(f"CityName '{city}' has 'City' suffix — try just '{city.rsplit(' ', 1)[0]}'.")
-    if len((address or "").split(",")[0].strip()) < 10:
-        reasons.append("Very short street address — may be incomplete.")
-    if not reasons:
-        reasons.append("Google could not find this address. Check for typos or incomplete details.")
-    return " | ".join(reasons)
+def failure_reason_and_action(status, job, error_message="", stages_tried=None, rejected_candidates=0):
+    status = clean_text(status) or "UNKNOWN"
+    stages = ", ".join(stages_tried or [])
+    street = clean_text(job.get("_street", ""))
+    city = clean_text(job.get("_city", ""))
+    postal = clean_text(job.get("_postal", ""))
+    admin1 = clean_text(job.get("_admin1", ""))
+    admin2 = clean_text(job.get("_admin2", ""))
+
+    if status == "NO_SEARCHABLE_ADDRESS":
+        return (
+            "No mapped street, postcode, city, county/district, or state/region value is available for this row.",
+            "Supply at least a street address or one usable geography field, then rerun the row."
+        )
+    if status == "REQUEST_DENIED":
+        detail = f" Google message: {error_message}" if error_message else ""
+        return (
+            "Google rejected the request or API key." + detail,
+            "Check that Geocoding API v3 is enabled, billing is active, and the API key restrictions allow this app."
+        )
+    if status == "OVER_QUERY_LIMIT":
+        return (
+            "Google continued returning OVER_QUERY_LIMIT after automatic global back-off and retries.",
+            "Rerun the failed rows with a lower queries-per-minute setting, or confirm the 6,000-QPM project quota is active."
+        )
+    if status in {"TIMEOUT", "CONNECTION_ERROR", "HTTP_ERROR", "UNKNOWN_ERROR"}:
+        detail = f" Last message: {error_message}" if error_message else ""
+        return (
+            f"The lookup failed because of a transient Google/network error ({status})." + detail,
+            "Rerun the unresolved rows. If it repeats, check network access and Google API status."
+        )
+    if status == "GEOGRAPHY_MISMATCH" or rejected_candidates:
+        return (
+            "Google returned one or more candidates, but they conflicted with the supplied geography and were rejected to avoid a likely false coordinate." + (f" Last check: {error_message}" if error_message else ""),
+            "Check the street, postcode, city and admin fields for contradictions. Correct the source geography and rerun; broader enabled fallbacks are already attempted automatically."
+        )
+    if status == "INVALID_REQUEST":
+        return (
+            "Google considered the generated query invalid, usually because the mapped location fields were empty or malformed.",
+            "Check the column mapping and source values for this row."
+        )
+    if status == "NO_STREET_FOR_PRIMARY":
+        supplied = [name for name, value in [("postcode", postal), ("city", city), ("county/district", admin2), ("state/region", admin1)] if value]
+        return (
+            f"No street address was supplied, and no enabled area fallback resolved the available {', '.join(supplied) if supplied else 'geography'}.",
+            "Enable the relevant postcode/city/admin fallback or supply a street address, then rerun the row."
+        )
+    if status in {"ZERO_RESULTS", "NO_ACCEPTABLE_FALLBACK"}:
+        supplied = []
+        if street: supplied.append("street")
+        if postal: supplied.append("postcode")
+        if city: supplied.append("city")
+        if admin2: supplied.append("county/district")
+        if admin1: supplied.append("state/region")
+        supplied_text = ", ".join(supplied) or "no usable geography"
+        tried_text = f" Strategies tried: {stages}." if stages else ""
+        return (
+            f"Google could not resolve the supplied {supplied_text} to an acceptable location.{tried_text}",
+            "Check for typos or missing geography. If the row is material, correct the source data and rerun it."
+        )
+    if status == "WORKER_ERROR":
+        return (
+            f"The app encountered an internal worker error. {error_message}".strip(),
+            "Rerun the failed rows. If the same row fails again, capture its values and the error text for investigation."
+        )
+    return (
+        f"Geocoding ended with status {status}." + (f" {error_message}" if error_message else ""),
+        "Review the source address/geography and rerun the row."
+    )
 
 
 def guess_column(field_name, available):
@@ -690,13 +880,37 @@ def apply_header(raw_df, header_row):
     return df, None
 
 
+def guess_header_row(raw_df, max_rows=15):
+    """Pick the most likely header row using known field aliases and basic header shape."""
+    known = {
+        "streetaddress", "street", "streetname", "address", "city", "cityname", "postalcode",
+        "postcode", "zip", "zipcode", "cntrycode", "countrycode", "country", "latitude", "longitude",
+        "lat", "lng", "lon", "admin1", "admin2", "state", "county", "addressid", "locnum"
+    }
+    best_row, best_score = 0, float("-inf")
+    for i in range(min(max_rows, len(raw_df))):
+        values = [clean_text(v) for v in raw_df.iloc[i].tolist()]
+        nonblank = [v for v in values if v]
+        if not nonblank:
+            continue
+        lowered = [re.sub(r"[^a-z0-9]+", "", v.casefold()) for v in nonblank]
+        alias_hits = sum(1 for v in lowered if v in known)
+        unique_ratio = len(set(lowered)) / max(1, len(lowered))
+        numeric_like = sum(1 for v in nonblank if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", v))
+        score = alias_hits * 10 + len(nonblank) * 0.25 + unique_ratio * 2 - numeric_like * 0.5
+        if score > best_score:
+            best_row, best_score = i, score
+    return best_row
+
+
 # =============================================================================
 # VALIDATION
 # =============================================================================
 
 def validate_dataframe(df, skip):
-    """Fast preflight. Flags are informative; they do not force a human review gate."""
+    """Fast, non-blocking preflight with actionable source-data diagnostics."""
     warnings = []
+    flagged_rows = {}
     total_rows = len(df)
 
     street = df["StreetAddress"].map(clean_text)
@@ -704,6 +918,8 @@ def validate_dataframe(df, skip):
     admin1 = df["Admin1Name"].map(clean_text) if "Admin1Name" in df.columns else pd.Series("", index=df.index)
     admin2 = df["Admin2Name"].map(clean_text) if "Admin2Name" in df.columns else pd.Series("", index=df.index)
     postal = df["PostalCode"].map(clean_text) if "PostalCode" in df.columns else pd.Series("", index=df.index)
+    cc = df["CountryCode"].map(clean_text).str.upper() if "CountryCode" in df.columns else pd.Series("", index=df.index)
+
     searchable = (street != "") | (city != "") | (admin1 != "") | (admin2 != "") | (postal != "")
     blank_street = street == ""
 
@@ -712,23 +928,38 @@ def validate_dataframe(df, skip):
     coord_valid = lat_num.between(-90, 90) & lng_num.between(-180, 180)
     any_coord_text = df["Latitude"].map(clean_text).ne("") | df["Longitude"].map(clean_text).ne("")
     invalid_coords = any_coord_text & ~coord_valid
+    unsearchable = ~searchable
 
     if blank_street.any():
-        warnings.append(f"{int(blank_street.sum()):,} row(s) have no street address; locality/postcode geocoding will be attempted automatically.")
+        warnings.append(
+            f"{int(blank_street.sum()):,} row(s) have no street address. They will start at postcode/city/admin fallback level instead of failing automatically."
+        )
     if invalid_coords.any():
-        warnings.append(f"{int(invalid_coords.sum()):,} row(s) have incomplete/invalid existing coordinates; they will be re-geocoded even when skip-existing is enabled.")
-    unsearchable = ~searchable
+        warnings.append(
+            f"{int(invalid_coords.sum()):,} row(s) contain incomplete or out-of-range coordinates. They will be geocoded again even when existing coordinates are kept."
+        )
+        flagged_rows["Invalid existing coordinates"] = df.loc[invalid_coords].head(200)
     if unsearchable.any():
-        warnings.append(f"{int(unsearchable.sum()):,} row(s) contain no usable address/geography fields and cannot be geocoded.")
+        warnings.append(
+            f"{int(unsearchable.sum()):,} row(s) contain no usable street or geography fields. These are the only rows guaranteed to remain unresolved."
+        )
+        flagged_rows["No searchable geography"] = df.loc[unsearchable].head(200)
 
-    # Country codes are soft evidence only. A dominant code is reported, not trusted as a hard filter.
-    cc = df["CountryCode"].map(clean_text).str.upper() if "CountryCode" in df.columns else pd.Series("", index=df.index)
     nonblank_cc = cc[cc != ""]
     if len(nonblank_cc):
         top_cc = nonblank_cc.value_counts().index[0]
         top_n = int((nonblank_cc == top_cc).sum())
         if top_n / len(nonblank_cc) >= 0.95:
-            warnings.append(f"Source country is overwhelmingly {top_cc} ({top_n:,}/{len(nonblank_cc):,}). Country is treated as a soft audit field, not a hard Google constraint.")
+            warnings.append(
+                f"CountryCode is overwhelmingly {top_cc} ({top_n:,}/{len(nonblank_cc):,}). Country remains soft evidence and is not used as a hard Google restriction."
+            )
+
+    # Four-digit postcodes are not automatically changed because they may be valid outside the US.
+    four_digit = postal.str.fullmatch(r"\d{4}", na=False)
+    if four_digit.any():
+        warnings.append(
+            f"{int(four_digit.sum()):,} row(s) have four-digit numeric postcodes. The app preserves them and lets Google normalise leading zeroes where appropriate rather than assuming they are US ZIP codes."
+        )
 
     needs = searchable & (~coord_valid if skip else True)
     keys = pd.DataFrame({
@@ -737,7 +968,7 @@ def validate_dataframe(df, skip):
     unique_jobs = int(keys.loc[needs].drop_duplicates().shape[0])
 
     return {
-        "errors": [], "warnings": warnings, "flagged_rows": {},
+        "errors": [], "warnings": warnings, "flagged_rows": flagged_rows,
         "stats": {
             "total_rows": total_rows,
             "unique_addresses": int(keys.loc[searchable].drop_duplicates().shape[0]),
@@ -745,6 +976,7 @@ def validate_dataframe(df, skip):
             "already_geocoded": int((searchable & coord_valid).sum()),
             "to_geocode": unique_jobs,
             "unsearchable": int(unsearchable.sum()),
+            "four_digit_postcodes": int(four_digit.sum()),
         }
     }
 
@@ -753,7 +985,7 @@ def validate_dataframe(df, skip):
 # GEOCODING
 # =============================================================================
 
-def process_dataframe(df, key, target_qpm, max_workers, skip):
+def process_dataframe(df, key, target_qpm, max_workers, skip, fallback_options):
     result = df.copy()
     result["Latitude"] = pd.to_numeric(result["Latitude"], errors="coerce")
     result["Longitude"] = pd.to_numeric(result["Longitude"], errors="coerce")
@@ -769,174 +1001,370 @@ def process_dataframe(df, key, target_qpm, max_workers, skip):
     result["_admin2"] = result["Admin2Name"]
     result["_postal"] = result["PostalCode"]
     result["_cc"] = result["CountryCode"].str.upper()
+    result["_full_addr"] = result.apply(
+        lambda r: _query_parts(r["_street"], r["_city"], r["_admin2"], r["_admin1"], r["_postal"]), axis=1
+    )
 
-    def build_addr(row):
-        return _query_parts(row["_street"], row["_city"], row["_admin2"], row["_admin1"], row["_postal"])
-
-    result["_full_addr"] = result.apply(build_addr, axis=1)
-    searchable = result["_full_addr"].ne("")
+    searchable = result[["_street", "_city", "_admin1", "_admin2", "_postal"]].apply(
+        lambda row: any(clean_text(x) for x in row), axis=1
+    )
     coord_valid = result.apply(lambda r: valid_coordinate_pair(r["Latitude"], r["Longitude"]), axis=1)
-
     had_coords = searchable & coord_valid
     orig_lats = result.loc[had_coords, "Latitude"].copy()
     orig_lngs = result.loc[had_coords, "Longitude"].copy()
     needs = searchable & (~coord_valid if skip else True)
 
-    # Explicit status prevents skipped coordinates from being reported as failed geocodes.
-    result["GoogleLocationType"] = ""
-    result["GeoMethod"] = ""
-    result["GeoStatus"] = ""
-    result["GeoAttempts"] = 0
-    result["GeoQuotaEvents"] = 0
-    result["GeoStatusHistory"] = ""
-    result["GeoQualityFlag"] = ""
-    result["GoogleFormattedAddress"] = ""
-    result["GooglePlaceID"] = ""
-    result["GoogleCountryCode"] = ""
-    result["GooglePostalCode"] = ""
-    result["GooglePartialMatch"] = False
-    result["AddrOnlyBetter"] = False
+    output_defaults = {
+        "GoogleLocationType": "", "GeoMethod": "", "GeoGranularity": "", "GeoStatus": "",
+        "GeoAttempts": 0, "GeoQuotaEvents": 0, "GeoStatusHistory": "", "GeoQualityFlag": "",
+        "GeoErrorReason": "", "GeoAction": "", "GeoQueryUsed": "", "GeoFallbackUsed": False,
+        "GeoRejectedCandidates": 0, "GoogleFormattedAddress": "", "GooglePlaceID": "",
+        "GoogleCountryCode": "", "GooglePostalCode": "", "GoogleCity": "",
+        "GoogleAdmin1": "", "GoogleAdmin2": "", "GooglePartialMatch": False, "AddrOnlyBetter": False,
+    }
+    for col, default in output_defaults.items():
+        result[col] = default
+
     result.loc[had_coords & skip, "GeoStatus"] = "EXISTING_SKIPPED"
+    result.loc[had_coords & skip, "GeoMethod"] = "existing"
+    result.loc[had_coords & skip, "GeoGranularity"] = "EXISTING"
     result.loc[~searchable, "GeoStatus"] = "NO_SEARCHABLE_ADDRESS"
 
     job_cols = ["_full_addr", "_street", "_city", "_admin1", "_admin2", "_postal", "_cc"]
     geo_sub = result.loc[needs, job_cols].copy()
-    # Country is not part of the query identity. Same address gets one Google job even if source country varies.
     dedupe_cols = ["_full_addr", "_street", "_city", "_admin1", "_admin2", "_postal"]
-    jobs = geo_sub.drop_duplicates(subset=dedupe_cols).to_dict("records")
+    jobs_df = geo_sub.drop_duplicates(subset=dedupe_cols)
+    jobs = jobs_df.to_dict("records")
     total = len(jobs)
 
     if total == 0:
-        st.info("Nothing to geocode.")
+        # Fill explicit reasons for unsearchable rows even when there is nothing to call Google for.
+        for idx in result.index[result["GeoStatus"].eq("NO_SEARCHABLE_ADDRESS")]:
+            reason, action = failure_reason_and_action("NO_SEARCHABLE_ADDRESS", {
+                "_street": result.at[idx, "_street"], "_city": result.at[idx, "_city"],
+                "_postal": result.at[idx, "_postal"], "_admin1": result.at[idx, "_admin1"],
+                "_admin2": result.at[idx, "_admin2"],
+            })
+            result.at[idx, "GeoErrorReason"] = reason
+            result.at[idx, "GeoAction"] = action
+        st.info("No rows require geocoding.")
         return result.drop(columns=job_cols), None
 
-    with st.expander("Sample primary searches"):
+    with st.expander("Search examples", expanded=False):
+        st.caption("Primary street-level search strings. Area fallbacks are generated only for unresolved locations.")
         for job in jobs[:5]:
-            st.text(job["_full_addr"])
+            st.code(job["_full_addr"] or "(no street-level query)", language=None)
 
     limiter = CombinedLimiter(target_qpm)
-    with st.spinner("Validating API key…"):
+    with st.spinner("Checking Google API access..."):
         test = single_geocode_call("10 Downing Street, London", key, limiter=limiter, retries=0)
         if test["status"] == "REQUEST_DENIED":
             msg = test.get("error_message") or "Google rejected the API key."
-            st.error(f"API key rejected: {msg}")
-            return result.drop(columns=job_cols), None
+            st.error(
+                f"Google API access check failed: {msg}\n\n"
+                "Check that Geocoding API v3 is enabled, billing is active, and this key's restrictions permit the request."
+            )
+            return None, None
+        if test["status"] not in {"OK", "ZERO_RESULTS"}:
+            st.warning(f"API access check returned {test['status']}. The run will continue, but network/quota conditions may affect results.")
 
-    prog = st.progress(0, text=f"Starting {total:,} unique address jobs…")
-    status_area = st.empty()
     geo_cache = st.session_state["_geocode_cache"]
-    local_results = {}
+    final_results = {}
+    primary_jobs = {}
     cache_hits = 0
-    total_api_calls = 0
-    completed = 0
-    failures = 0
-    fallbacks = 0
-    recovered_quota_jobs = 0
-    permanent_quota_failures = 0
+    stage_stats = {}
+    progress = st.progress(0, text=f"Street-level pass: 0 of {total:,} unique locations")
+    status_area = st.empty()
 
-    def cache_key(job):
-        return (CACHE_VERSION, job["_full_addr"], job["_street"], job["_city"], job["_admin1"], job["_admin2"], job["_postal"])
+    def primary_cache_key(job):
+        return (CACHE_VERSION, "primary", job["_full_addr"], job["_street"], job["_city"], job["_admin1"], job["_admin2"], job["_postal"])
+
+    for job in jobs:
+        ck = primary_cache_key(job)
+        primary_jobs[ck] = job
 
     pending = []
-    for job in jobs:
-        ck = cache_key(job)
+    for ck, job in primary_jobs.items():
         cached = geo_cache.get(ck)
         if cached and cached.get("status") == "OK":
-            local_results[ck] = cached
+            final_results[ck] = cached
             cache_hits += 1
-            completed += 1
         else:
             pending.append((ck, job))
 
-    def run_job(job):
+    def run_primary(job):
         return geocode_address(
             job["_full_addr"], job["_street"], key,
-            country_code=job.get("_cc") or None,
-            city=job.get("_city") or None,
-            admin1=job.get("_admin1") or None,
-            admin2=job.get("_admin2") or None,
-            postal_code=job.get("_postal") or None,
-            limiter=limiter,
+            country_code=job.get("_cc") or None, city=job.get("_city") or None,
+            admin1=job.get("_admin1") or None, admin2=job.get("_admin2") or None,
+            postal_code=job.get("_postal") or None, limiter=limiter,
         )
 
-    if completed:
-        prog.progress(completed / total, text=f"{completed:,} of {total:,} complete ({cache_hits:,} cached)…")
-
+    completed = cache_hits
+    primary_requests = 0
+    primary_quota = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(run_job, job): (ck, job) for ck, job in pending}
-        last_ui_update = time.monotonic()
-        for fut in as_completed(future_map):
-            ck, job = future_map[fut]
+        futures = {executor.submit(run_primary, job): (ck, job) for ck, job in pending}
+        last_ui = time.monotonic()
+        for fut in as_completed(futures):
+            ck, job = futures[fut]
             try:
                 geo = fut.result()
             except Exception as exc:
                 geo = {
                     "lat": None, "lng": None, "status": "WORKER_ERROR", "location_type": None,
-                    "method": "failed", "fallback": False, "detail": str(exc), "api_calls": 0,
-                    "formatted_address": "", "place_id": "", "google_country": "", "google_postal": "",
-                    "partial_match": False, "quality_flag": "Worker error", "error_message": str(exc),
-                    "quota_events": 0, "status_history": ["WORKER_ERROR"],
+                    "method": "primary", "granularity": "", "fallback": False, "detail": str(exc),
+                    "api_calls": 0, "formatted_address": "", "place_id": "", "google_country": "",
+                    "google_postal": "", "google_city": "", "google_admin1": "", "google_admin2": "",
+                    "result_types": [], "partial_match": False, "quality_flag": "", "error_message": str(exc),
+                    "quota_events": 0, "status_history": ["primary:WORKER_ERROR"], "rejected_candidates": 0,
                 }
-            local_results[ck] = geo
-            total_api_calls += int(geo.get("api_calls", 0))
-            quota_events = int(geo.get("quota_events", 0))
+            final_results[ck] = geo
+            primary_requests += int(geo.get("api_calls", 0))
+            primary_quota += int(geo.get("quota_events", 0))
             if geo.get("status") == "OK":
-                # Cache successes only. Transient failures never poison the rest of the session.
                 geo_cache[ck] = geo
-                if geo.get("fallback"):
-                    fallbacks += 1
-                if quota_events > 0:
-                    recovered_quota_jobs += 1
-            else:
-                failures += 1
-                if geo.get("status") == "OVER_QUERY_LIMIT":
-                    permanent_quota_failures += 1
             completed += 1
-
             now = time.monotonic()
-            if now - last_ui_update >= 0.15 or completed == total:
-                prog.progress(completed / total, text=f"Geocoding {completed:,} of {total:,} unique jobs…")
+            if now - last_ui >= 0.15 or completed == total:
                 snap = limiter.snapshot()
+                progress.progress(completed / total, text=f"Street-level pass: {completed:,} of {total:,} unique locations")
                 status_area.caption(
-                    f"{completed:,}/{total:,} complete | {snap['total_requests']:,} actual Google requests | "
-                    f"rolling minute {snap['current_rolling_qpm']:,}/{target_qpm:,} | "
-                    f"peak {snap['peak_rolling_qpm']:,} | {snap['over_query_limit_events']:,} quota responses | "
-                    f"{cache_hits:,} cached | {failures:,} failed so far"
+                    f"{snap['total_requests']:,} Google requests | rolling minute {snap['current_rolling_qpm']:,}/{target_qpm:,} | "
+                    f"peak {snap['peak_rolling_qpm']:,} | quota responses {snap['over_query_limit_events']:,} | cache hits {cache_hits:,}"
                 )
-                last_ui_update = now
+                last_ui = now
 
-    prog.progress(1.0, text="Geocoding complete")
+    stage_stats["Street search"] = {"lookups": len(pending), "requests": primary_requests, "cache_hits": cache_hits}
 
-    # Apply unique Google results back to source rows with a hash-based lookup.
-    # The previous implementation scanned the full source DataFrame once per unique job, which became
-    # catastrophically slow on large portfolios (25k jobs x 45k rows). This is O(rows + jobs) instead.
-    unique_jobs = geo_sub.drop_duplicates(subset=dedupe_cols)
+    # Accumulators are tracked per original unique location job. Shared centroid lookups are counted once globally,
+    # while each row receives the full audit history explaining which strategies were tried for it.
+    accum = {}
+    for ck, job in primary_jobs.items():
+        g = final_results[ck]
+        accum[ck] = {
+            "api_calls": int(g.get("api_calls", 0)),
+            "quota_events": int(g.get("quota_events", 0)),
+            "status_history": list(g.get("status_history", [])),
+            "rejected_candidates": int(g.get("rejected_candidates", 0)),
+            "stages_tried": ["street search"],
+            "last_error": g.get("error_message", ""),
+            "last_status": g.get("status", ""),
+        }
+
+    def unresolved_keys():
+        return [ck for ck, g in final_results.items() if g.get("status") != "OK"]
+
+    def fallback_spec(stage, job):
+        city, postal, admin1, admin2, cc = job["_city"], job["_postal"], job["_admin1"], job["_admin2"], job["_cc"]
+        specs = {
+            "city_postal": (bool(city and postal), _query_parts(city, postal, admin1), "POSTAL_CODE", {"city": city, "postal_code": postal, "admin1": admin1 or None}),
+            "postal": (bool(postal), _query_parts(postal, admin1), "POSTAL_CODE", {"postal_code": postal, "admin1": admin1 or None}),
+            "city_admin1": (bool(city and admin1), _query_parts(city, admin1), "CITY", {"city": city, "admin1": admin1}),
+            "city": (bool(city), city, "CITY", {"city": city}),
+            "admin2_admin1": (bool(admin2), _query_parts(admin2, admin1), "ADMIN2", {"admin2": admin2, "admin1": admin1 or None}),
+            "admin2": (bool(admin2), admin2, "ADMIN2", {"admin2": admin2}),
+            "admin1": (bool(admin1), admin1, "ADMIN1", {"admin1": admin1}),
+            "country": (bool(cc), cc, "COUNTRY", {"country_code": cc}),
+        }
+        return specs[stage]
+
+    method_names = {
+        "city_postal": "postcode_city_centroid", "postal": "postcode_centroid",
+        "city_admin1": "city_admin1_centroid", "city": "city_centroid",
+        "admin2_admin1": "admin2_admin1_centroid", "admin2": "admin2_centroid",
+        "admin1": "admin1_centroid", "country": "country_centroid",
+    }
+    stage_labels = {
+        "city_postal": "Postcode + city fallback", "postal": "Postcode fallback",
+        "city_admin1": "City + state/region fallback", "city": "City fallback",
+        "admin2_admin1": "County/district + state/region fallback", "admin2": "County/district fallback",
+        "admin1": "State/region fallback", "country": "Country fallback",
+    }
+
+    stages = []
+    if fallback_options.get("postal"):
+        stages += ["city_postal", "postal"]
+    if fallback_options.get("city"):
+        stages += ["city_admin1", "city"]
+    if fallback_options.get("admin"):
+        stages += ["admin2_admin1", "admin2", "admin1"]
+    if fallback_options.get("country"):
+        stages += ["country"]
+
+    for stage in stages:
+        unresolved = unresolved_keys()
+        if not unresolved:
+            break
+
+        stage_to_primary = {}
+        unique_lookups = {}
+        for ck in unresolved:
+            job = primary_jobs[ck]
+            eligible, query, granularity, score_kwargs = fallback_spec(stage, job)
+            if not eligible or not query:
+                continue
+            fallback_key = (CACHE_VERSION, "fallback", stage, query.casefold())
+            stage_to_primary[ck] = fallback_key
+            if fallback_key not in unique_lookups:
+                unique_lookups[fallback_key] = {
+                    "query": query, "granularity": granularity, "score_kwargs": score_kwargs, "example_job": job
+                }
+            accum[ck]["stages_tried"].append(stage_labels[stage].lower())
+
+        if not unique_lookups:
+            continue
+
+        progress.progress(0, text=f"{stage_labels[stage]}: preparing {len(unique_lookups):,} deduplicated lookup(s)")
+        stage_results = {}
+        stage_cache_hits = 0
+        stage_pending = []
+        for fck, spec in unique_lookups.items():
+            cached = geo_cache.get(fck)
+            if cached and cached.get("status") == "OK":
+                stage_results[fck] = cached
+                stage_cache_hits += 1
+            else:
+                stage_pending.append((fck, spec))
+
+        def run_area(spec):
+            return single_geocode_call(spec["query"], key, limiter=limiter, **spec["score_kwargs"])
+
+        stage_requests = 0
+        done = stage_cache_hits
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(run_area, spec): (fck, spec) for fck, spec in stage_pending}
+            last_ui = time.monotonic()
+            for fut in as_completed(futures):
+                fck, spec = futures[fut]
+                try:
+                    geo = fut.result()
+                except Exception as exc:
+                    geo = {
+                        "lat": None, "lng": None, "status": "WORKER_ERROR", "location_type": None,
+                        "formatted_address": "", "place_id": "", "google_country": "", "google_postal": "",
+                        "google_city": "", "google_admin1": "", "google_admin2": "", "result_types": [],
+                        "partial_match": False, "error_message": str(exc), "api_calls": 0, "quota_events": 0,
+                        "status_history": ["WORKER_ERROR"], "match_score": 0,
+                    }
+                geo["query_used"] = spec["query"]
+                stage_results[fck] = geo
+                stage_requests += int(geo.get("api_calls", 0))
+                if geo.get("status") == "OK":
+                    geo_cache[fck] = geo
+                done += 1
+                now = time.monotonic()
+                if now - last_ui >= 0.15 or done == len(unique_lookups):
+                    snap = limiter.snapshot()
+                    progress.progress(done / len(unique_lookups), text=f"{stage_labels[stage]}: {done:,} of {len(unique_lookups):,}")
+                    status_area.caption(
+                        f"{snap['total_requests']:,} Google requests | rolling minute {snap['current_rolling_qpm']:,}/{target_qpm:,} | "
+                        f"peak {snap['peak_rolling_qpm']:,} | quota responses {snap['over_query_limit_events']:,}"
+                    )
+                    last_ui = now
+
+        accepted = 0
+        rejected = 0
+        for ck, fck in stage_to_primary.items():
+            geo = stage_results.get(fck)
+            if not geo:
+                continue
+            acc = accum[ck]
+            acc["api_calls"] += int(geo.get("api_calls", 0))
+            acc["quota_events"] += int(geo.get("quota_events", 0))
+            acc["status_history"].extend([f"{stage}:{x}" for x in geo.get("status_history", [])])
+            if geo.get("error_message"):
+                acc["last_error"] = geo.get("error_message", "")
+            acc["last_status"] = geo.get("status", acc.get("last_status", ""))
+
+            job = primary_jobs[ck]
+            is_accepted, actual_granularity, rejection_reason = assess_area_candidate(stage, geo, job)
+            if is_accepted:
+                accepted += 1
+                granularity = actual_granularity
+                method = method_names[stage]
+                fallback_action = (
+                    "Use the fallback coordinates as an area-level location. Correct the source street/postcode and rerun "
+                    "if street-level accuracy is required for this exposure."
+                )
+                final_geo = {
+                    **geo,
+                    "method": method,
+                    "granularity": granularity,
+                    "fallback": True,
+                    "addr_only_better": False,
+                    "detail": f"Street-level search was unresolved; resolved using {stage_labels[stage].lower()}.",
+                    "api_calls": acc["api_calls"], "quota_events": acc["quota_events"],
+                    "status_history": acc["status_history"], "rejected_candidates": acc["rejected_candidates"],
+                    "error_reason": "", "action": fallback_action,
+                }
+                final_geo["quality_flag"] = _quality_flags(
+                    final_geo, job.get("_cc"), job.get("_postal"), bool(job.get("_street")), granularity, method
+                )
+                final_results[ck] = final_geo
+            elif geo.get("status") == "OK":
+                rejected += 1
+                acc["rejected_candidates"] += 1
+                acc["last_status"] = "GEOGRAPHY_MISMATCH"
+                acc["status_history"].append(f"{stage}:REJECTED_GEOGRAPHY")
+                if rejection_reason:
+                    acc["last_error"] = rejection_reason
+
+        stage_stats[stage_labels[stage]] = {
+            "lookups": len(unique_lookups), "requests": stage_requests, "cache_hits": stage_cache_hits,
+            "accepted": accepted, "rejected": rejected,
+        }
+
+    # Finalise unresolved unique jobs with a precise reason/action.
+    for ck in unresolved_keys():
+        job = primary_jobs[ck]
+        previous = final_results[ck]
+        acc = accum[ck]
+        status = acc.get("last_status") or previous.get("status", "ZERO_RESULTS")
+        if acc["rejected_candidates"] > 0 and status in {"ZERO_RESULTS", "NO_STREET_FOR_PRIMARY", "GEOGRAPHY_MISMATCH", "OK"}:
+            status = "GEOGRAPHY_MISMATCH"
+        reason, action = failure_reason_and_action(
+            status, job, acc["last_error"], acc["stages_tried"], acc["rejected_candidates"]
+        )
+        final_results[ck] = {
+            **previous,
+            "status": status,
+            "method": "failed",
+            "granularity": "",
+            "fallback": False,
+            "api_calls": acc["api_calls"], "quota_events": acc["quota_events"],
+            "status_history": acc["status_history"], "rejected_candidates": acc["rejected_candidates"],
+            "error_reason": reason, "action": action,
+        }
+
+    progress.progress(1.0, text="Geocoding and geographic fallbacks complete")
+
+    # Apply unique results back to source rows in one hash-based join.
     lookup_rows = []
     geo_by_key = {}
-    for _, job in unique_jobs.iterrows():
-        job_dict = job.to_dict()
-        ck = cache_key(job_dict)
-        geo = local_results.get(ck)
+    for _, job_series in jobs_df.iterrows():
+        job = job_series.to_dict()
+        ck = primary_cache_key(job)
+        geo = final_results.get(ck)
         if not geo:
             continue
-        key_tuple = tuple(job_dict[c] for c in dedupe_cols)
+        key_tuple = tuple(job[c] for c in dedupe_cols)
         geo_by_key[key_tuple] = geo
         lookup_rows.append({
-            **{c: job_dict[c] for c in dedupe_cols},
-            "_GeoStatus": geo.get("status", ""),
-            "_GeoAttempts": int(geo.get("api_calls", 0)),
+            **{c: job[c] for c in dedupe_cols},
+            "_GeoStatus": geo.get("status", ""), "_GeoAttempts": int(geo.get("api_calls", 0)),
             "_GeoQuotaEvents": int(geo.get("quota_events", 0)),
             "_GeoStatusHistory": " > ".join(map(str, geo.get("status_history", []))),
-            "_GeoMethod": geo.get("method", ""),
+            "_GeoMethod": geo.get("method", ""), "_GeoGranularity": geo.get("granularity", ""),
+            "_GeoQueryUsed": geo.get("query_used", ""), "_GeoFallbackUsed": bool(geo.get("fallback", False)),
+            "_GeoRejectedCandidates": int(geo.get("rejected_candidates", 0)),
             "_GoogleLocationType": geo.get("location_type") or "",
-            "_GoogleFormattedAddress": geo.get("formatted_address", ""),
-            "_GooglePlaceID": geo.get("place_id", ""),
-            "_GoogleCountryCode": geo.get("google_country", ""),
-            "_GooglePostalCode": geo.get("google_postal", ""),
-            "_GooglePartialMatch": bool(geo.get("partial_match", False)),
-            "_AddrOnlyBetter": bool(geo.get("addr_only_better", False)),
-            "_GeoLat": geo.get("lat"),
-            "_GeoLng": geo.get("lng"),
+            "_GoogleFormattedAddress": geo.get("formatted_address", ""), "_GooglePlaceID": geo.get("place_id", ""),
+            "_GoogleCountryCode": geo.get("google_country", ""), "_GooglePostalCode": geo.get("google_postal", ""),
+            "_GoogleCity": geo.get("google_city", ""), "_GoogleAdmin1": geo.get("google_admin1", ""),
+            "_GoogleAdmin2": geo.get("google_admin2", ""), "_GooglePartialMatch": bool(geo.get("partial_match", False)),
+            "_AddrOnlyBetter": bool(geo.get("addr_only_better", False)), "_GeoLat": geo.get("lat"), "_GeoLng": geo.get("lng"),
+            "_GeoErrorReason": geo.get("error_reason", ""), "_GeoAction": geo.get("action", ""),
         })
 
     if lookup_rows:
@@ -946,52 +1374,66 @@ def process_dataframe(df, key, target_qpm, max_workers, skip):
         matched = lookup.reindex(target_keys)
         matched.index = target_rows.index
 
-        result.loc[needs, "GeoStatus"] = matched["_GeoStatus"].fillna("").values
-        result.loc[needs, "GeoAttempts"] = matched["_GeoAttempts"].fillna(0).astype(int).values
-        result.loc[needs, "GeoQuotaEvents"] = matched["_GeoQuotaEvents"].fillna(0).astype(int).values
-        result.loc[needs, "GeoStatusHistory"] = matched["_GeoStatusHistory"].fillna("").values
-        result.loc[needs, "GeoMethod"] = matched["_GeoMethod"].fillna("").values
-        result.loc[needs, "GoogleLocationType"] = matched["_GoogleLocationType"].fillna("").values
-        result.loc[needs, "GoogleFormattedAddress"] = matched["_GoogleFormattedAddress"].fillna("").values
-        result.loc[needs, "GooglePlaceID"] = matched["_GooglePlaceID"].fillna("").values
-        result.loc[needs, "GoogleCountryCode"] = matched["_GoogleCountryCode"].fillna("").values
-        result.loc[needs, "GooglePostalCode"] = matched["_GooglePostalCode"].fillna("").values
-        result.loc[needs, "GooglePartialMatch"] = matched["_GooglePartialMatch"].fillna(False).astype(bool).values
-        result.loc[needs, "AddrOnlyBetter"] = matched["_AddrOnlyBetter"].fillna(False).astype(bool).values
+        assignments = {
+            "GeoStatus": "_GeoStatus", "GeoAttempts": "_GeoAttempts", "GeoQuotaEvents": "_GeoQuotaEvents",
+            "GeoStatusHistory": "_GeoStatusHistory", "GeoMethod": "_GeoMethod", "GeoGranularity": "_GeoGranularity",
+            "GeoQueryUsed": "_GeoQueryUsed", "GeoFallbackUsed": "_GeoFallbackUsed",
+            "GeoRejectedCandidates": "_GeoRejectedCandidates", "GoogleLocationType": "_GoogleLocationType",
+            "GoogleFormattedAddress": "_GoogleFormattedAddress", "GooglePlaceID": "_GooglePlaceID",
+            "GoogleCountryCode": "_GoogleCountryCode", "GooglePostalCode": "_GooglePostalCode",
+            "GoogleCity": "_GoogleCity", "GoogleAdmin1": "_GoogleAdmin1", "GoogleAdmin2": "_GoogleAdmin2",
+            "GooglePartialMatch": "_GooglePartialMatch", "AddrOnlyBetter": "_AddrOnlyBetter",
+            "GeoErrorReason": "_GeoErrorReason", "GeoAction": "_GeoAction",
+        }
+        for out_col, in_col in assignments.items():
+            vals = matched[in_col]
+            if out_col in {"GeoAttempts", "GeoQuotaEvents", "GeoRejectedCandidates"}:
+                result.loc[needs, out_col] = vals.fillna(0).astype(int).values
+            elif out_col in {"GeoFallbackUsed", "GooglePartialMatch", "AddrOnlyBetter"}:
+                result.loc[needs, out_col] = vals.fillna(False).astype(bool).values
+            else:
+                result.loc[needs, out_col] = vals.fillna("").values
 
-        ok_coords = (
-            matched["_GeoStatus"].eq("OK")
-            & pd.to_numeric(matched["_GeoLat"], errors="coerce").notna()
-            & pd.to_numeric(matched["_GeoLng"], errors="coerce").notna()
-        )
+        ok_coords = matched["_GeoStatus"].eq("OK") & pd.to_numeric(matched["_GeoLat"], errors="coerce").notna() & pd.to_numeric(matched["_GeoLng"], errors="coerce").notna()
         ok_idx = matched.index[ok_coords]
         result.loc[ok_idx, "Latitude"] = matched.loc[ok_idx, "_GeoLat"].values
         result.loc[ok_idx, "Longitude"] = matched.loc[ok_idx, "_GeoLng"].values
 
-        # Quality flags depend on source-country/postcode evidence, so calculate them once per source row.
-        # This is at most one pass over the rows being geocoded, rather than one full scan per unique job.
         for idx in target_rows.index:
             key_tuple = tuple(result.at[idx, c] for c in dedupe_cols)
             geo = geo_by_key.get(key_tuple)
-            if geo:
-                result.at[idx, "GeoQualityFlag"] = _quality_flags(
-                    geo, result.at[idx, "_cc"], result.at[idx, "_postal"], bool(result.at[idx, "_street"])
-                )
+            if not geo:
+                continue
+            result.at[idx, "GeoQualityFlag"] = _quality_flags(
+                geo, result.at[idx, "_cc"], result.at[idx, "_postal"], bool(result.at[idx, "_street"]),
+                geo.get("granularity"), geo.get("method")
+            )
 
-    succeeded = sum(1 for g in local_results.values() if g.get("status") == "OK")
-    failed = total - succeeded
+    # Explicit errors for rows that were never searchable.
+    for idx in result.index[result["GeoStatus"].eq("NO_SEARCHABLE_ADDRESS")]:
+        reason, action = failure_reason_and_action("NO_SEARCHABLE_ADDRESS", {
+            "_street": result.at[idx, "_street"], "_city": result.at[idx, "_city"], "_postal": result.at[idx, "_postal"],
+            "_admin1": result.at[idx, "_admin1"], "_admin2": result.at[idx, "_admin2"],
+        })
+        result.at[idx, "GeoErrorReason"] = reason
+        result.at[idx, "GeoAction"] = action
+
     final_snap = limiter.snapshot()
+    unique_success = sum(1 for g in final_results.values() if g.get("status") == "OK")
+    unique_failed = total - unique_success
+    stage_lines = []
+    for name, stats in stage_stats.items():
+        extra = ""
+        if "accepted" in stats:
+            extra = f", {stats['accepted']:,} resolved"
+        stage_lines.append(f"{name}: {stats['lookups']:,} lookup(s), {stats['requests']:,} request(s){extra}")
     status_area.markdown(
-        f"**{succeeded:,}** unique locations geocoded, **{failed:,}** failed. "
-        f"**{final_snap['total_requests']:,}** actual Google requests this run, "
-        f"peak rolling minute **{final_snap['peak_rolling_qpm']:,}/{target_qpm:,}**. "
-        f"Google returned **{final_snap['over_query_limit_events']:,}** OVER_QUERY_LIMIT response(s); "
-        f"**{recovered_quota_jobs:,}** job(s) recovered after quota back-off and "
-        f"**{permanent_quota_failures:,}** finished as quota failures. "
-        f"**{cache_hits:,}** cache hits, **{fallbacks:,}** fallback resolutions, **{len(result):,}** source rows."
+        f"**{unique_success:,}** unique locations resolved; **{unique_failed:,}** unresolved. "
+        f"**{final_snap['total_requests']:,}** actual Google requests; peak rolling minute "
+        f"**{final_snap['peak_rolling_qpm']:,}/{target_qpm:,}**; **{final_snap['over_query_limit_events']:,}** quota response(s).\n\n"
+        + "  \n".join(stage_lines)
     )
 
-    # Comparison report before internal columns are removed.
     comp = None
     if not skip:
         cidx = had_coords[had_coords].index
@@ -999,10 +1441,9 @@ def process_dataframe(df, key, target_qpm, max_workers, skip):
             comp = pd.DataFrame({
                 "AddressID": result.loc[cidx, "AddressID"].values,
                 "StreetAddress": result.loc[cidx, "StreetAddress"].values,
-                "Original_Latitude": orig_lats.values,
-                "Original_Longitude": orig_lngs.values,
-                "New_Latitude": result.loc[cidx, "Latitude"].values,
-                "New_Longitude": result.loc[cidx, "Longitude"].values,
+                "Original_Latitude": orig_lats.values, "Original_Longitude": orig_lngs.values,
+                "New_Latitude": result.loc[cidx, "Latitude"].values, "New_Longitude": result.loc[cidx, "Longitude"].values,
+                "GeoGranularity": result.loc[cidx, "GeoGranularity"].values,
                 "GoogleLocationType": result.loc[cidx, "GoogleLocationType"].values,
                 "GeoMethod": result.loc[cidx, "GeoMethod"].values,
                 "GeoQualityFlag": result.loc[cidx, "GeoQualityFlag"].values,
@@ -1010,8 +1451,7 @@ def process_dataframe(df, key, target_qpm, max_workers, skip):
             dists = []
             for _, r in comp.iterrows():
                 if valid_coordinate_pair(r["Original_Latitude"], r["Original_Longitude"]) and valid_coordinate_pair(r["New_Latitude"], r["New_Longitude"]):
-                    dists.append(round(haversine_m(float(r["Original_Latitude"]), float(r["Original_Longitude"]),
-                                                   float(r["New_Latitude"]), float(r["New_Longitude"])), 2))
+                    dists.append(round(haversine_m(float(r["Original_Latitude"]), float(r["Original_Longitude"]), float(r["New_Latitude"]), float(r["New_Longitude"])), 2))
                 else:
                     dists.append(None)
             comp["Distance_m"] = dists
@@ -1033,88 +1473,64 @@ def build_recommendations(result_df, comparison_df=None, has_tiv=False, total_ti
                 distance_lookup[aid] = float(dist)
 
     recs = []
+    priority_by_granularity = {"COUNTRY": 2, "ADMIN1": 2, "ADMIN2": 3, "CITY": 3, "POSTAL_CODE": 4, "APPROXIMATE": 4}
+    label_by_granularity = {
+        "COUNTRY": "Country centroid", "ADMIN1": "State/region centroid", "ADMIN2": "County/district centroid",
+        "CITY": "City centroid", "POSTAL_CODE": "Postcode/ZIP centroid", "APPROXIMATE": "Approximate area result",
+    }
+
     for _, row in result_df.iterrows():
-        geo_status = clean_text(row.get("GeoStatus", ""))
-        if geo_status == "EXISTING_SKIPPED":
+        status = clean_text(row.get("GeoStatus", ""))
+        if status == "EXISTING_SKIPPED":
             continue
-
+        granularity = clean_text(row.get("GeoGranularity", ""))
         addr_id = clean_text(row.get("AddressID", ""))
-        street = clean_text(row.get("StreetAddress", ""))
-        loc_type = clean_text(row.get("GoogleLocationType", ""))
-        method = clean_text(row.get("GeoMethod", ""))
-        quality_flag = clean_text(row.get("GeoQualityFlag", ""))
-        lat = row.get("Latitude")
-        lng = row.get("Longitude")
-
         tiv = float(row.get("_TIV", 0)) if has_tiv and pd.notna(row.get("_TIV")) else None
         pct = (tiv / total_tiv * 100) if tiv and total_tiv > 0 else None
-        tiv_note = f" Location TIV: {tiv:,.0f} ({pct:.2f}% of portfolio)." if tiv and tiv > 0 else ""
-
         dist_m = distance_lookup.get(addr_id)
         dist_km = dist_m / 1000 if dist_m is not None else None
-        distance_flag = "red" if dist_km is not None and dist_km >= 50 else "orange" if dist_km is not None and dist_km >= 5 else None
 
-        rec_entry = {
-            "AddressID": addr_id, "StreetAddress": street,
-            "GoogleLocationType": loc_type, "GeoMethod": method,
-            "GeoStatus": geo_status, "GeoQualityFlag": quality_flag,
+        entry = {
+            "AddressID": addr_id,
+            "StreetAddress": clean_text(row.get("StreetAddress", "")),
+            "CityName": clean_text(row.get("CityName", "")),
+            "PostalCode": clean_text(row.get("PostalCode", "")),
+            "GeoStatus": status,
+            "GeoGranularity": granularity,
+            "GeoMethod": clean_text(row.get("GeoMethod", "")),
+            "GeoQualityFlag": clean_text(row.get("GeoQualityFlag", "")),
+            "GeoErrorReason": clean_text(row.get("GeoErrorReason", "")),
+            "GeoAction": clean_text(row.get("GeoAction", "")),
             "Distance_km": dist_km, "TIV": tiv, "TIV_Pct": pct,
         }
 
-        if geo_status == "NO_SEARCHABLE_ADDRESS":
-            rec_entry.update({
-                "Category": "Failed - no usable geography", "Priority": 1,
-                "Recommendation": "No street, city, admin or postcode information was available to search." + tiv_note,
-            })
-            recs.append(rec_entry)
-        elif geo_status != "OK" or not valid_coordinate_pair(lat, lng):
-            rec_entry.update({
-                "Category": "Failed", "Priority": 1,
-                "Recommendation": f"Geocoding failed ({geo_status or 'unknown status'}). Review only if the location matters materially." + tiv_note,
-            })
-            recs.append(rec_entry)
-        elif distance_flag == "red":
-            rec_entry.update({
-                "Category": "Large coordinate discrepancy", "Priority": 1,
-                "Recommendation": f"New coordinates are {dist_km:,.1f}km from the original. Verify which location is correct." + tiv_note,
-            })
-            recs.append(rec_entry)
-        elif loc_type == "APPROXIMATE":
-            rec_entry.update({
-                "Category": "Very low precision", "Priority": 2,
-                "Recommendation": "Google returned an approximate locality/region-level point. Use only with appropriate caution for catastrophe modelling." + tiv_note,
-            })
-            recs.append(rec_entry)
-        elif distance_flag == "orange":
-            rec_entry.update({
-                "Category": "Notable coordinate difference", "Priority": 3,
-                "Recommendation": f"New coordinates are {dist_km:,.1f}km from the original. Check if the location is material." + tiv_note,
-            })
-            recs.append(rec_entry)
-        elif loc_type in {"GEOMETRIC_CENTER", "RANGE_INTERPOLATED"}:
-            meaning = "street/building geometry centre" if loc_type == "GEOMETRIC_CENTER" else "interpolated street position"
-            rec_entry.update({
-                "Category": "Below rooftop", "Priority": 4,
-                "Recommendation": f"Google returned a {meaning}. {quality_flag}".strip() + tiv_note,
-            })
-            recs.append(rec_entry)
-        elif quality_flag:
-            rec_entry.update({
-                "Category": "Rooftop - source data flag", "Priority": 5,
-                "Recommendation": f"Rooftop coordinates achieved. {quality_flag}" + tiv_note,
-            })
-            recs.append(rec_entry)
-        elif method != "primary":
-            rec_entry.update({
-                "Category": "Rooftop - fallback", "Priority": 5,
-                "Recommendation": f"Rooftop coordinates achieved via {method} fallback." + tiv_note,
-            })
-            recs.append(rec_entry)
-        # Clean ROOFTOP primary result with no flags: no review required.
+        if status != "OK" or not valid_coordinate_pair(row.get("Latitude"), row.get("Longitude")):
+            entry.update({"Category": "Unresolved", "Priority": 1, "Recommendation": entry["GeoAction"]})
+            recs.append(entry)
+        elif dist_km is not None and dist_km >= 50:
+            entry.update({"Category": "Large coordinate discrepancy", "Priority": 1,
+                          "Recommendation": f"New coordinates are {dist_km:,.1f} km from the original. Verify which location is correct."})
+            recs.append(entry)
+        elif granularity in priority_by_granularity:
+            entry.update({"Category": label_by_granularity[granularity], "Priority": priority_by_granularity[granularity],
+                          "Recommendation": f"Coordinates are usable but only at {label_by_granularity[granularity].lower()} level. Review if street-level accuracy is material."})
+            recs.append(entry)
+        elif dist_km is not None and dist_km >= 5:
+            entry.update({"Category": "Notable coordinate difference", "Priority": 3,
+                          "Recommendation": f"New coordinates are {dist_km:,.1f} km from the original. Check if the difference is material."})
+            recs.append(entry)
+        elif clean_text(row.get("GoogleLocationType", "")) in {"GEOMETRIC_CENTER", "RANGE_INTERPOLATED"}:
+            entry.update({"Category": "Below rooftop", "Priority": 5,
+                          "Recommendation": "Street-level coordinates were returned below rooftop precision. Review only where exact location is material."})
+            recs.append(entry)
+        elif clean_text(row.get("GeoQualityFlag", "")):
+            entry.update({"Category": "Source data flag", "Priority": 6,
+                          "Recommendation": clean_text(row.get("GeoQualityFlag", ""))})
+            recs.append(entry)
 
     if not recs:
         return None
-    return pd.DataFrame(recs).sort_values("Priority").reset_index(drop=True)
+    return pd.DataFrame(recs).sort_values(["Priority", "Category"]).reset_index(drop=True)
 
 
 def apply_column_mapping(df, mapping):
@@ -1137,224 +1553,269 @@ def apply_column_mapping(df, mapping):
 
 
 def render_geocode_results(res_df, comp_df, run_skip_existing):
-    """Render saved results outside the Geocode button event so Streamlit reruns do not erase them."""
     if res_df is None:
         return
 
-    st.subheader("Results")
-    st.dataframe(res_df, use_container_width=True)
-    st.download_button(
-        "📥 Download geocoded CSV", res_df.to_csv(index=False),
-        "geocoded_output.csv", "text/csv", key="dl_geocoded"
-    )
+    st.divider()
+    st.header("Results")
 
-    # Map preview
-    md = res_df[["StreetAddress", "Latitude", "Longitude"]].copy()
-    md["Latitude"] = pd.to_numeric(md["Latitude"], errors="coerce")
-    md["Longitude"] = pd.to_numeric(md["Longitude"], errors="coerce")
-    md = md.dropna(subset=["Latitude", "Longitude"])
-    if len(md) > 10000:
-        md = md.sample(10000, random_state=42)
-        st.caption("Map preview sampled to 10,000 points for browser performance; downloaded results contain all rows.")
-    if len(md) > 0:
-        st.subheader("Map Preview")
-        st.markdown("Hover over a point to see the address.")
-        clat, clng = md["Latitude"].mean(), md["Longitude"].mean()
-        sp = max(md["Latitude"].max() - md["Latitude"].min(),
-                 md["Longitude"].max() - md["Longitude"].min())
-        zm = 14 if sp < 0.01 else 11 if sp < 0.1 else 8 if sp < 1 else 5 if sp < 10 else 2
-        ps = st.slider("Point size (pixels)", 2, 20, 6, 1, key="result_point_size")
-        layer = pdk.Layer(
-            "ScatterplotLayer", data=md, get_position=["Longitude", "Latitude"], get_radius=100,
-            radius_min_pixels=ps, radius_max_pixels=ps * 3,
-            get_fill_color=[65, 105, 225, 180], pickable=True, auto_highlight=True
+    status = res_df["GeoStatus"].fillna("")
+    valid_coords = res_df.apply(lambda r: valid_coordinate_pair(r.get("Latitude"), r.get("Longitude")), axis=1)
+    resolved = status.isin(["OK", "EXISTING_SKIPPED"]) & valid_coords
+    unresolved = ~resolved
+    gran = res_df["GeoGranularity"].fillna("")
+
+    fallback_mask = res_df.get("GeoFallbackUsed", pd.Series(False, index=res_df.index)).fillna(False).astype(bool) & resolved
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Rows with coordinates", f"{int(resolved.sum()):,}", f"{(resolved.mean()*100 if len(res_df) else 0):.1f}%")
+    m2.metric("Street level", f"{int((gran == 'STREET').sum()):,}")
+    m3.metric("Postcode / ZIP", f"{int((gran == 'POSTAL_CODE').sum()):,}")
+    m4.metric("City / admin centroid", f"{int(gran.isin(['CITY','ADMIN2','ADMIN1']).sum()):,}")
+    m5.metric("Fallback-resolved", f"{int(fallback_mask.sum()):,}")
+    m6.metric("Unresolved", f"{int(unresolved.sum()):,}")
+
+    d1, d2, d3 = st.columns([1, 1, 1])
+    with d1:
+        st.download_button(
+            "Download full geocoded CSV", res_df.to_csv(index=False),
+            "geocoded_output.csv", "text/csv", type="primary", key="dl_geocoded"
         )
-        tip = {
-            "html": "<b>{StreetAddress}</b><br/>Lat: {Latitude}<br/>Lng: {Longitude}",
-            "style": {"backgroundColor": "#1a1a2e", "color": "white", "fontSize": "12px"},
-        }
-        st.pydeck_chart(pdk.Deck(
-            layers=[layer],
-            initial_view_state=pdk.ViewState(latitude=clat, longitude=clng, zoom=zm, pitch=0),
-            tooltip=tip, map_provider="carto", map_style="light"
-        ))
+    with d2:
+        unresolved_df = res_df.loc[unresolved].copy()
+        if len(unresolved_df):
+            st.download_button(
+                "Download unresolved rows", unresolved_df.to_csv(index=False),
+                "geocode_unresolved.csv", "text/csv", key="dl_unresolved"
+            )
+    with d3:
+        fallback_df = res_df.loc[fallback_mask].copy()
+        if len(fallback_df):
+            st.download_button(
+                "Download fallback-resolved rows", fallback_df.to_csv(index=False),
+                "geocode_fallback_resolved.csv", "text/csv", key="dl_fallback"
+            )
 
-    # Recommendations
+    if unresolved.any():
+        st.error(
+            f"{int(unresolved.sum()):,} row(s) still have no usable coordinates. "
+            "Each unresolved row includes GeoErrorReason and GeoAction so the next step is explicit."
+        )
+        failure_summary = (
+            res_df.loc[unresolved, ["GeoStatus", "GeoErrorReason"]]
+            .fillna("")
+            .groupby(["GeoStatus", "GeoErrorReason"], dropna=False)
+            .size().reset_index(name="Rows").sort_values("Rows", ascending=False)
+        )
+        st.dataframe(failure_summary, use_container_width=True, hide_index=True)
+        error_cols = [c for c in [
+            "AddressID", "StreetAddress", "CityName", "PostalCode", "CountryCode", "GeoStatus",
+            "GeoErrorReason", "GeoAction", "GeoStatusHistory", "GeoRejectedCandidates"
+        ] if c in res_df.columns]
+        st.dataframe(res_df.loc[unresolved, error_cols], use_container_width=True, hide_index=True)
+
+    # Quality mix makes centroid use visible instead of silently blending it into rooftop coordinates.
+    st.subheader("Resolution quality")
+    quality = (
+        res_df.assign(_Resolution=res_df["GeoGranularity"].replace("", "UNRESOLVED"))
+        .groupby("_Resolution", dropna=False).size().rename("Rows").reset_index()
+        .rename(columns={"_Resolution": "Resolution"}).sort_values("Rows", ascending=False)
+    )
+    quality["Percent"] = (quality["Rows"] / len(res_df) * 100).round(1)
+    st.dataframe(quality, use_container_width=True, hide_index=True)
+
     has_tiv = "_TIV" in res_df.columns
     total_tiv = res_df["_TIV"].sum() if has_tiv else 0
     rec_df = build_recommendations(res_df, comp_df, has_tiv=has_tiv, total_tiv=total_tiv)
-
-    if rec_df is not None and len(rec_df) > 0:
-        st.subheader("Step 5: Recommendations")
-        if has_tiv and total_tiv > 0:
-            flagged_tiv = rec_df["TIV"].fillna(0).sum()
-            clean_tiv = total_tiv - flagged_tiv
-            clean_pct = clean_tiv / total_tiv * 100
-            st.markdown(
-                f"**{clean_pct:.1f}%** of portfolio TIV (**{clean_tiv:,.0f}** of {total_tiv:,.0f}) "
-                f"geocoded to ROOFTOP with no flags — no action needed on those."
-            )
-
-        st.markdown("The following rows need attention. Clean ROOFTOP primary results are not listed.")
-        cat_counts = rec_df["Category"].value_counts()
-        for cat in sorted(
-            cat_counts.index,
-            key=lambda x: rec_df.loc[rec_df["Category"] == x, "Priority"].iloc[0]
-        ):
-            cat_tiv = ""
-            if has_tiv and "TIV" in rec_df.columns:
-                cat_total = rec_df.loc[rec_df["Category"] == cat, "TIV"].fillna(0).sum()
-                if cat_total > 0:
-                    cat_pct = cat_total / total_tiv * 100 if total_tiv > 0 else 0
-                    cat_tiv = f" — TIV: {cat_total:,.0f} ({cat_pct:.1f}% of portfolio)"
-            st.markdown(f"- {cat}: **{cat_counts[cat]}** row(s){cat_tiv}")
-
+    if rec_df is not None and len(rec_df):
+        st.subheader("Review queue")
+        st.caption("Only unresolved, lower-granularity, materially moved, or otherwise flagged rows appear here.")
+        counts = rec_df.groupby(["Priority", "Category"]).size().reset_index(name="Rows").sort_values(["Priority", "Rows"], ascending=[True, False])
+        st.dataframe(counts[["Category", "Rows"]], use_container_width=True, hide_index=True)
         display_cols = [c for c in rec_df.columns if c != "Priority"]
-        st.dataframe(rec_df[display_cols], use_container_width=True)
+        with st.expander(f"Open review queue ({len(rec_df):,} rows)", expanded=False):
+            st.dataframe(rec_df[display_cols], use_container_width=True, hide_index=True)
         st.download_button(
-            "📥 Download recommendations CSV", rec_df[display_cols].to_csv(index=False),
-            "geocode_recommendations.csv", "text/csv", key="dl_rec"
+            "Download review queue", rec_df[display_cols].to_csv(index=False),
+            "geocode_review_queue.csv", "text/csv", key="dl_rec"
         )
     else:
-        st.success("🎉 All addresses geocoded at ROOFTOP precision — no recommendations needed!")
+        st.success("No rows require review.")
+
+    with st.expander("Full result preview", expanded=False):
+        st.dataframe(res_df.head(1000), use_container_width=True, hide_index=True)
+        if len(res_df) > 1000:
+            st.caption("Preview limited to the first 1,000 rows. The download contains the full dataset.")
+
+    md_cols = [c for c in ["AddressID", "StreetAddress", "CityName", "PostalCode", "GeoGranularity", "Latitude", "Longitude"] if c in res_df.columns]
+    md = res_df[md_cols].copy()
+    md["Latitude"] = pd.to_numeric(md["Latitude"], errors="coerce")
+    md["Longitude"] = pd.to_numeric(md["Longitude"], errors="coerce")
+    md = md.dropna(subset=["Latitude", "Longitude"])
+    if len(md):
+        with st.expander("Map preview", expanded=False):
+            if len(md) > 10000:
+                md = md.sample(10000, random_state=42)
+                st.caption("Map sampled to 10,000 points for browser performance. Downloads retain every row.")
+            clat, clng = md["Latitude"].mean(), md["Longitude"].mean()
+            span = max(md["Latitude"].max() - md["Latitude"].min(), md["Longitude"].max() - md["Longitude"].min())
+            zoom = 14 if span < 0.01 else 11 if span < 0.1 else 8 if span < 1 else 5 if span < 10 else 2
+            point_size = st.slider("Map point size", 2, 16, 5, 1, key="result_point_size")
+            layer = pdk.Layer(
+                "ScatterplotLayer", data=md, get_position=["Longitude", "Latitude"], get_radius=100,
+                radius_min_pixels=point_size, radius_max_pixels=point_size * 3,
+                get_fill_color=[65, 105, 225, 180], pickable=True, auto_highlight=True
+            )
+            tooltip = {
+                "html": "<b>{StreetAddress}</b><br/>{CityName} {PostalCode}<br/>Resolution: {GeoGranularity}<br/>Lat: {Latitude}<br/>Lng: {Longitude}",
+                "style": {"backgroundColor": "#1a1a2e", "color": "white", "fontSize": "12px"},
+            }
+            st.pydeck_chart(pdk.Deck(
+                layers=[layer], initial_view_state=pdk.ViewState(latitude=clat, longitude=clng, zoom=zoom, pitch=0),
+                tooltip=tooltip, map_provider="carto", map_style="light"
+            ))
 
     if not run_skip_existing:
-        if comp_df is not None and len(comp_df) > 0:
-            st.subheader("Comparison Report")
-            st.markdown("Original vs newly geocoded coordinates, with distance and quality.")
-            st.dataframe(comp_df, use_container_width=True)
+        st.subheader("Coordinate comparison")
+        if comp_df is not None and len(comp_df):
+            st.dataframe(comp_df, use_container_width=True, hide_index=True)
             st.download_button(
-                "📥 Download comparison report", comp_df.to_csv(index=False),
+                "Download coordinate comparison", comp_df.to_csv(index=False),
                 "geocode_comparison_report.csv", "text/csv", key="dl_comp"
             )
         else:
-            st.info("ℹ️ No comparison report — no rows had existing coordinates.")
+            st.info("No original valid coordinate pairs were available for comparison.")
 
 
 # =============================================================================
 # MAIN APP
 # =============================================================================
 
-uploaded = st.file_uploader("Upload your file", type=["csv", "xlsx", "xls", "txt", "tsv"])
+st.header("1. Upload")
+uploaded = st.file_uploader(
+    "Exposure file", type=["csv", "xlsx", "xls", "txt", "tsv"],
+    help="CSV, Excel, TSV, or delimited text. Source columns not used for geocoding are preserved in the output."
+)
 
 if uploaded:
+    file_bytes = uploaded.getvalue()
+    file_signature = hashlib.sha256(file_bytes).hexdigest()
+    if st.session_state.get("_active_file_signature") != file_signature:
+        st.session_state["_active_file_signature"] = file_signature
+        st.session_state["_last_geocode_results"] = None
+        st.session_state["_last_geocode_comparison"] = None
+        st.session_state["_last_input_signature"] = None
+
     raw_df, err = read_raw_file(uploaded)
     if err:
-        st.error(err)
+        st.error(f"The file could not be read. {err} Check the file type, delimiter, and whether the file opens normally in Excel/text editor.")
         st.stop()
 
-    st.subheader("Step 1: Select the header row")
-    st.markdown("Pick the row that contains your column names.")
-    preview = min(15, len(raw_df))
-    disp = raw_df.head(preview).copy()
-    disp.index = [f"Row {i}" for i in range(preview)]
-    st.dataframe(disp, use_container_width=True)
-    header_row = st.number_input("Header row number", 0, max(0, len(raw_df) - 2), 0, 1)
-    df_h, h_err = apply_header(raw_df, header_row)
+    detected_header = guess_header_row(raw_df)
+    st.success(
+        f"Loaded {uploaded.name}. Detected encoding: {raw_df.attrs.get('encoding', 'n/a')}. "
+        f"Likely header row: {detected_header}."
+    )
+    with st.expander("Raw file preview and header selection", expanded=detected_header != 0):
+        preview = min(15, len(raw_df))
+        disp = raw_df.head(preview).copy()
+        disp.index = [f"Row {i}" for i in range(preview)]
+        st.dataframe(disp, use_container_width=True)
+        header_row = st.number_input(
+            "Header row number", 0, max(0, len(raw_df) - 2), int(detected_header), 1,
+            help="Change this only if the highlighted/detected row is not the actual column header."
+        )
+    if detected_header == 0:
+        header_row = 0 if 'header_row' not in locals() else header_row
+
+    df_h, h_err = apply_header(raw_df, int(header_row))
     if h_err:
-        st.error(h_err)
+        st.error(f"Header selection is invalid: {h_err} Choose the row containing unique, non-blank column names.")
         st.stop()
     avail = list(df_h.columns)
-    st.success(f"Row {header_row} as header. **{len(df_h)}** data rows, **{len(avail)}** columns.")
+    st.caption(f"{len(df_h):,} data rows and {len(avail):,} source columns after the selected header.")
 
-    # Step 2: Column mapping
-    st.subheader("Step 2: Map your columns")
-
-    # Template presets
+    st.header("2. Map fields")
     TEMPLATES = {
-        "Custom (map everything manually)": {
-            "fields": ALL_FIELDS,
-            "description": "Full control — map each field yourself."
-        },
         "Terrorism 4020": {
             "fields": ["StreetAddress", "CityName", "PostalCode", "CountryCode"],
-            "description": "StreetAddress, CityName, PostalCode, CountryCode → returns Lat/Lng + quality."
+            "description": "Recommended for the Terrorism 4020 RMS-style files. Street, city, postcode and country are auto-detected where possible."
         },
         "Full RiskLink export": {
-            "fields": [OPTIONAL_ID, "StreetAddress", "Latitude", "Longitude",
-                       "CityName", "Admin2Name", "Admin1Name", "PostalCode", "CountryCode"],
-            "description": "All fields including AddressID, coordinates, and admin levels."
+            "fields": [OPTIONAL_ID, "StreetAddress", "Latitude", "Longitude", "CityName", "Admin2Name", "Admin1Name", "PostalCode", "CountryCode"],
+            "description": "Use all available address, admin, identifier and coordinate fields."
         },
         "Coordinates only (re-geocode)": {
-            "fields": ["StreetAddress", "Latitude", "Longitude", "CountryCode"],
-            "description": "Re-geocode existing data — StreetAddress + existing coords + country."
+            "fields": ["StreetAddress", "Latitude", "Longitude", "CityName", "PostalCode", "CountryCode"],
+            "description": "Compare new Google coordinates with existing coordinates."
         },
-        "Minimal (street address only)": {
-            "fields": ["StreetAddress"],
-            "description": "Just the street address — geocode with no constraints."
+        "Minimal": {
+            "fields": ["StreetAddress", "CityName", "PostalCode"],
+            "description": "Use whatever street/city/postcode information is available. StreetAddress is not mandatory."
         },
+        "Custom": {"fields": ALL_FIELDS, "description": "Expose every canonical field for manual mapping."},
     }
-
-    template = st.selectbox("Template", list(TEMPLATES.keys()), index=1,
-                            help="Pick a preset to show only the fields your team uses, or choose Custom for full control.")
+    template = st.selectbox("Mapping template", list(TEMPLATES.keys()), index=0)
     st.caption(TEMPLATES[template]["description"])
 
-    active_fields = TEMPLATES[template]["fields"]
-
-    st.markdown("Match each field to a column from your file.")
     opts = [UNMAPPED] + avail
     mapping = {}
+    active_fields = TEMPLATES[template]["fields"]
+    mapping_guesses = {field: guess_column(field, avail) for field in active_fields}
+    searchable_guess_count = sum(
+        mapping_guesses.get(f) != UNMAPPED
+        for f in ["StreetAddress", "CityName", "PostalCode", "Admin2Name", "Admin1Name"]
+        if f in active_fields
+    )
+    needs_mapping_attention = searchable_guess_count == 0 or (
+        "StreetAddress" in active_fields and mapping_guesses.get("StreetAddress") == UNMAPPED
+    )
+    with st.expander("Review column mapping", expanded=needs_mapping_attention):
+        field_groups = [active_fields[i:i + 4] for i in range(0, len(active_fields), 4)]
+        for group in field_groups:
+            cols = st.columns(len(group))
+            for col_ui, field in zip(cols, group):
+                guessed = mapping_guesses[field]
+                idx = opts.index(guessed) if guessed in opts else 0
+                with col_ui:
+                    mapping[field] = st.selectbox(field, opts, idx, key=f"m_{field}")
+        st.caption("Fields not shown by the selected template are ignored unless you switch to Custom.")
+    mapped_summary = [f"{field} ← {mapping_guesses[field]}" for field in active_fields if mapping_guesses.get(field) != UNMAPPED]
+    if mapped_summary:
+        st.caption("Initial auto-detection: " + " · ".join(mapped_summary))
 
-    # Always map active fields
-    # Group them into rows of 3-4
-    field_groups = [active_fields[i:i+4] for i in range(0, len(active_fields), 4)]
-    for group in field_groups:
-        cols = st.columns(len(group))
-        for col_ui, field in zip(cols, group):
-            idx = opts.index(guess_column(field, avail)) if guess_column(field, avail) in opts else 0
-            with col_ui:
-                label = f"{field}" if field in CORE_FIELDS else f"{field} (opt)"
-                mapping[field] = st.selectbox(label, opts, idx, key=f"m_{field}")
-
-    # Set unmapped for fields not in the active template
     for field in ALL_FIELDS:
         if field not in mapping:
             mapping[field] = UNMAPPED
-
-    st.markdown("**Value fields (optional — for TIV context in recommendations):**")
-    st.caption("Select columns with insured values. They will be summed into a Total Insured Value per row.")
-    value_columns = st.multiselect("Value columns", options=avail, default=[], key="m_values")
-
-    st.markdown("**Your column mappings:**")
-    lines = []
-    for f in ALL_FIELDS:
-        s = mapping.get(f, UNMAPPED)
-        lines.append(f"- **{f}** ← `{s}`" if s != UNMAPPED else f"- **{f}** ← *(not mapped)*")
-    if value_columns:
-        lines.append(f"- **TIV** ← `{', '.join(value_columns)}`")
-    st.markdown("\n".join(lines))
-
-    if mapping.get("StreetAddress") == UNMAPPED:
-        st.warning("**StreetAddress** must be mapped to continue.")
-        st.stop()
-
-    mapped_optional = [f for f in LOCATION_FIELDS if mapping.get(f) != UNMAPPED]
-    has_id = mapping.get(OPTIONAL_ID) != UNMAPPED
-    has_coords = mapping.get("Latitude") != UNMAPPED and mapping.get("Longitude") != UNMAPPED
-
-    if not mapped_optional:
-        st.info("ℹ️ No location fields mapped — geocoding will rely on the street address alone.")
-    if not has_id:
-        st.info("ℹ️ No AddressID mapped — row numbers will be used as identifiers.")
-    if not has_coords:
-        st.info("ℹ️ No Latitude/Longitude mapped — all rows will be geocoded.")
 
     mapped_vals = [c for c in mapping.values() if c != UNMAPPED]
     if len(mapped_vals) != len(set(mapped_vals)):
         seen, dupes = set(), set()
         for c in mapped_vals:
-            (dupes if c in seen else seen).add(c)
-        st.error(f"Column **{', '.join(dupes)}** mapped to multiple fields.")
+            if c in seen:
+                dupes.add(c)
+            seen.add(c)
+        st.error(
+            f"A source column is mapped more than once: {', '.join(sorted(dupes))}. "
+            "Map each source column to only one canonical field."
+        )
         st.stop()
 
+    searchable_mapped = any(mapping.get(f) != UNMAPPED for f in ["StreetAddress", "CityName", "PostalCode", "Admin2Name", "Admin1Name"])
+    if not searchable_mapped:
+        st.error("No searchable location field is mapped. Map at least StreetAddress, CityName, PostalCode, Admin2Name, or Admin1Name.")
+        st.stop()
+
+    value_columns = st.multiselect(
+        "Value/TIV columns (optional)", options=avail, default=[],
+        help="Selected columns are summed into _TIV so review queues can show portfolio materiality."
+    )
+
     df_m = apply_column_mapping(df_h, mapping)
-    for field in LOCATION_FIELDS:
+    for field in LOCATION_FIELDS + ["StreetAddress"]:
         if field not in df_m.columns:
             df_m[field] = ""
-    if "StreetAddress" not in df_m.columns:
-        df_m["StreetAddress"] = ""
     if "AddressID" not in df_m.columns:
-        df_m["AddressID"] = [f"ROW_{i+1}" for i in range(len(df_m))]
+        df_m["AddressID"] = [f"ROW_{i + 1}" for i in range(len(df_m))]
     for field in COORD_FIELDS:
         if field not in df_m.columns:
             df_m[field] = ""
@@ -1362,73 +1823,110 @@ if uploaded:
     if value_columns:
         df_m["_TIV"] = 0.0
         for vc in value_columns:
-            if vc in df_m.columns:
-                df_m["_TIV"] += pd.to_numeric(df_m[vc], errors="coerce").fillna(0)
-        total_portfolio_tiv = df_m["_TIV"].sum()
-        st.caption(f"Total portfolio value: **{total_portfolio_tiv:,.0f}** across {len(value_columns)} value column(s).")
+            df_m["_TIV"] += pd.to_numeric(df_m[vc], errors="coerce").fillna(0)
+        st.caption(f"Portfolio value from selected columns: {df_m['_TIV'].sum():,.0f}")
 
-    st.subheader("Mapped data preview (first 10 rows)")
-    st.dataframe(df_m.head(10), use_container_width=True)
+    with st.expander("Mapped data preview", expanded=False):
+        st.dataframe(df_m.head(20), use_container_width=True, hide_index=True)
 
-    # Step 3: Validation
-    st.subheader("Step 3: Validation")
+    st.header("3. Preflight")
     val = validate_dataframe(df_m, skip_existing)
-    s = val["stats"]
+    stats = val["stats"]
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total Rows", s["total_rows"])
-    c2.metric("Unique Addresses", s["unique_addresses"])
-    c3.metric("Already Geocoded", s["already_geocoded"])
-    c4.metric("Blank Addresses", s["blank_addresses"])
-    c5.metric("To Geocode", s["to_geocode"])
+    c1.metric("Source rows", f"{stats['total_rows']:,}")
+    c2.metric("Unique jobs", f"{stats['to_geocode']:,}")
+    c3.metric("Valid existing", f"{stats['already_geocoded']:,}")
+    c4.metric("No street", f"{stats['blank_addresses']:,}")
+    c5.metric("Unsearchable", f"{stats['unsearchable']:,}")
 
-    has_err = False
     if val["warnings"]:
-        st.markdown("#### ⚠️ Warnings")
-        for w in val["warnings"]:
-            st.warning(w)
-    if val["flagged_rows"]:
-        st.markdown("#### 🔍 Flagged Rows")
-        for lbl, fdf in val["flagged_rows"].items():
-            with st.expander(f"{lbl} ({len(fdf)} rows)"):
-                st.dataframe(fdf, use_container_width=True)
-    if not val["warnings"]:
-        st.success("Preflight complete — no obvious source-data issues detected.")
+        st.warning(f"Preflight found {len(val['warnings'])} source-data condition(s). They do not block the run.")
+        with st.expander("Preflight details", expanded=False):
+            for warning in val["warnings"]:
+                st.markdown(f"- {warning}")
+            for label, fdf in val["flagged_rows"].items():
+                st.markdown(f"**{label}**")
+                st.dataframe(fdf, use_container_width=True, hide_index=True)
     else:
-        st.caption("Preflight flags are informational. Geocoding continues automatically; only genuinely unresolved rows need review afterward.")
+        st.success("Preflight found no obvious source-data issues.")
 
-    # Step 4: Geocode
-    st.divider()
-    st.subheader("Step 4: Geocode")
-    if st.button("Geocode", disabled=not api_key, type="primary"):
+    fallback_options = {
+        "postal": fallback_postal,
+        "city": fallback_city,
+        "admin": fallback_admin,
+        "country": fallback_country,
+    }
+    enabled_fallbacks = [name for name, enabled in [
+        ("postcode/ZIP", fallback_postal), ("city", fallback_city), ("county/state/region", fallback_admin), ("country", fallback_country)
+    ] if enabled]
+    st.caption(
+        f"Unresolved street searches will fall back through: {', '.join(enabled_fallbacks) if enabled_fallbacks else 'no area-centroid fallbacks'}. "
+        "Fallback lookups are deduplicated across the file."
+    )
+    if enabled_fallbacks:
+        st.info(
+            "Fallbacks progressively trade precision for coverage. The app records the level actually returned by Google, "
+            "so a city result from a city+postcode query is labelled CITY rather than POSTAL_CODE. Stronger results are never replaced by coarser fallbacks."
+        )
+
+    signature_payload = repr((
+        file_signature, int(header_row), tuple(sorted(mapping.items())), tuple(value_columns), skip_existing,
+        tuple(sorted(fallback_options.items()))
+    )).encode("utf-8")
+    input_signature = hashlib.sha256(signature_payload).hexdigest()
+
+    st.header("4. Run")
+    b1, b2 = st.columns([1, 2])
+    primary_floor_min = (stats['to_geocode'] / max(1, target_qpm))
+    with b1:
+        start_run = st.button(
+            f"Geocode {stats['to_geocode']:,} unique location{'s' if stats['to_geocode'] != 1 else ''}",
+            disabled=not api_key or stats['to_geocode'] == 0, type="primary", use_container_width=True
+        )
+    with b2:
+        st.caption(
+            f"QPM ceiling {target_qpm:,} · workers {max_workers} · theoretical first-pass floor ~{primary_floor_min:.1f} min before network latency/fallbacks. "
+            f"Existing valid coordinates are {'kept' if skip_existing else 're-geocoded'}."
+        )
+
+    if start_run:
         if not api_key:
-            st.error("Enter your API key in the sidebar.")
+            st.error("Enter the Google Geocoding API key in the sidebar before starting.")
         else:
-            res_df, comp_df = process_dataframe(df_m, api_key, target_qpm, max_workers, skip_existing)
+            # Avoid leaving old output visible beneath a new run.
+            st.session_state["_last_geocode_results"] = None
+            st.session_state["_last_geocode_comparison"] = None
+            res_df, comp_df = process_dataframe(
+                df_m, api_key, target_qpm, max_workers, skip_existing, fallback_options
+            )
             if res_df is not None:
                 st.session_state["_last_geocode_results"] = res_df
                 st.session_state["_last_geocode_comparison"] = comp_df
                 st.session_state["_last_geocode_skip_existing"] = skip_existing
+                st.session_state["_last_input_signature"] = input_signature
 
-    # Results persist across normal Streamlit reruns (map slider, download clicks, sidebar changes).
-    render_geocode_results(
-        st.session_state.get("_last_geocode_results"),
-        st.session_state.get("_last_geocode_comparison"),
-        st.session_state.get("_last_geocode_skip_existing", True),
-    )
+    saved_results = st.session_state.get("_last_geocode_results")
+    if saved_results is not None and st.session_state.get("_last_input_signature") != input_signature:
+        st.info("The file, mapping, fallback policy, or existing-coordinate setting has changed since the last run. Previous results are hidden to avoid showing stale output.")
+    else:
+        render_geocode_results(
+            saved_results,
+            st.session_state.get("_last_geocode_comparison"),
+            st.session_state.get("_last_geocode_skip_existing", True),
+        )
 
 else:
+    st.info("Upload an exposure file to begin. The app auto-detects common RMS/Terrorism 4020 columns and the likely header row; only genuinely ambiguous mapping needs human input.")
     st.markdown(
         """
-        ### How to use
-        1. Paste your **Google Geocoding API key** in the sidebar.
-        2. Upload a file — CSV, Excel (.xlsx / .xls), or delimited text (.txt / .tsv).
-        3. **Select the header row** — pick which row contains your column names.
-        4. **Map your columns** — only `StreetAddress` is required. Optionally map `Latitude`/`Longitude`, `AddressID`, location fields, and value columns for richer output.
-        5. Review the **automatic preflight summary**. Flags do not block processing.
-        6. Click **Geocode** — unique locations are processed concurrently, source country is treated as soft evidence, and fallbacks run only when needed.
-        7. Review only the **recommendations** for genuinely weak or unresolved rows.
-        8. Download the results and comparison report.
+        **Workflow**
 
-        Any additional columns in your file are preserved as-is in the output.
+        1. Upload the file and confirm the detected header.
+        2. Review the auto-mapped address fields.
+        3. Check the non-blocking preflight summary.
+        4. Run geocoding. Strong street results stop immediately; unresolved locations progressively fall back to postcode, city and admin centroids according to the sidebar policy.
+        5. Download the full output or work only from the explicit unresolved/review queues.
+
+        The output always records the resolution level (`GeoGranularity`), method, Google status history, quality flags, and actionable failure reason where applicable.
         """
     )
