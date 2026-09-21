@@ -21,13 +21,31 @@ if not api_key:
 
 st.sidebar.header("Settings")
 skip_existing = st.sidebar.checkbox("Skip rows that already have valid coordinates", value=True)
+
+# Ark Google Cloud project quota: 6,000 Geocoding v3 requests/minute (100/sec).
+# Default to 95/sec to leave a small safety margin for quota-window jitter and other users of the same project.
+GOOGLE_QPM_QUOTA = 6000
+GOOGLE_RPS_HARD_LIMIT = GOOGLE_QPM_QUOTA // 60
+GOOGLE_RPS_DEFAULT = 95
+
 target_rps = st.sidebar.slider(
-    "Google requests per second", 5, 49, 45, 1,
-    help="Quota safety limit. This replaces the old artificial delay between rows."
+    "Google requests per second", 5, 99, GOOGLE_RPS_DEFAULT, 1,
+    help=(
+        f"Ark quota is {GOOGLE_QPM_QUOTA:,} requests/minute ({GOOGLE_RPS_HARD_LIMIT}/sec). "
+        "The default 95/sec leaves a small safety margin below the project limit."
+    )
 )
 max_workers = st.sidebar.slider(
-    "Concurrent workers", 4, 64, 32, 4,
-    help="Number of address jobs processed concurrently. API calls are still governed by the requests/sec limit."
+    "Concurrent workers", 8, 128, 96, 8,
+    help=(
+        "Number of address jobs processed concurrently. The 96-worker default is sized to keep the "
+        "95 requests/sec limiter busy even when Google responses take around a second. "
+        "API calls are still capped by the requests/sec setting."
+    )
+)
+st.sidebar.caption(
+    f"Approved Geocoding v3 quota: {GOOGLE_QPM_QUOTA:,} requests/minute. "
+    f"Recommended operating rate: {GOOGLE_RPS_DEFAULT}/sec."
 )
 
 st.sidebar.header("Cache")
@@ -35,6 +53,12 @@ if "_geocode_cache" not in st.session_state:
     st.session_state["_geocode_cache"] = {}
 if "_confirm_clear" not in st.session_state:
     st.session_state["_confirm_clear"] = False
+if "_last_geocode_results" not in st.session_state:
+    st.session_state["_last_geocode_results"] = None
+if "_last_geocode_comparison" not in st.session_state:
+    st.session_state["_last_geocode_comparison"] = None
+if "_last_geocode_skip_existing" not in st.session_state:
+    st.session_state["_last_geocode_skip_existing"] = True
 
 cache_display = st.sidebar.empty()
 cache_display.caption(f"**{len(st.session_state['_geocode_cache'])}** addresses cached this session.")
@@ -724,39 +748,72 @@ def process_dataframe(df, key, target_rps, max_workers, skip):
 
     prog.progress(1.0, text="Geocoding complete")
 
-    # Apply each unique Google result to every matching source row. Source-country flags are recalculated
-    # per row because source country was deliberately excluded from deduplication/query constraints.
-    for _, job in geo_sub.drop_duplicates(subset=dedupe_cols).iterrows():
+    # Apply unique Google results back to source rows with a hash-based lookup.
+    # The previous implementation scanned the full source DataFrame once per unique job, which became
+    # catastrophically slow on large portfolios (25k jobs x 45k rows). This is O(rows + jobs) instead.
+    unique_jobs = geo_sub.drop_duplicates(subset=dedupe_cols)
+    lookup_rows = []
+    geo_by_key = {}
+    for _, job in unique_jobs.iterrows():
         job_dict = job.to_dict()
         ck = cache_key(job_dict)
         geo = local_results.get(ck)
         if not geo:
             continue
-        mask = needs.copy()
-        for c in dedupe_cols:
-            mask &= result[c].eq(job_dict[c])
+        key_tuple = tuple(job_dict[c] for c in dedupe_cols)
+        geo_by_key[key_tuple] = geo
+        lookup_rows.append({
+            **{c: job_dict[c] for c in dedupe_cols},
+            "_GeoStatus": geo.get("status", ""),
+            "_GeoAttempts": int(geo.get("api_calls", 0)),
+            "_GeoMethod": geo.get("method", ""),
+            "_GoogleLocationType": geo.get("location_type") or "",
+            "_GoogleFormattedAddress": geo.get("formatted_address", ""),
+            "_GooglePlaceID": geo.get("place_id", ""),
+            "_GoogleCountryCode": geo.get("google_country", ""),
+            "_GooglePostalCode": geo.get("google_postal", ""),
+            "_GooglePartialMatch": bool(geo.get("partial_match", False)),
+            "_AddrOnlyBetter": bool(geo.get("addr_only_better", False)),
+            "_GeoLat": geo.get("lat"),
+            "_GeoLng": geo.get("lng"),
+        })
 
-        result.loc[mask, "GeoStatus"] = geo.get("status", "")
-        result.loc[mask, "GeoAttempts"] = int(geo.get("api_calls", 0))
-        result.loc[mask, "GeoMethod"] = geo.get("method", "")
-        result.loc[mask, "GoogleLocationType"] = geo.get("location_type") or ""
-        result.loc[mask, "GoogleFormattedAddress"] = geo.get("formatted_address", "")
-        result.loc[mask, "GooglePlaceID"] = geo.get("place_id", "")
-        result.loc[mask, "GoogleCountryCode"] = geo.get("google_country", "")
-        result.loc[mask, "GooglePostalCode"] = geo.get("google_postal", "")
-        result.loc[mask, "GooglePartialMatch"] = bool(geo.get("partial_match", False))
-        result.loc[mask, "AddrOnlyBetter"] = bool(geo.get("addr_only_better", False))
+    if lookup_rows:
+        lookup = pd.DataFrame(lookup_rows).set_index(dedupe_cols)
+        target_rows = result.loc[needs, dedupe_cols]
+        target_keys = pd.MultiIndex.from_frame(target_rows)
+        matched = lookup.reindex(target_keys)
+        matched.index = target_rows.index
 
-        if geo.get("status") == "OK" and geo.get("lat") is not None:
-            result.loc[mask, "Latitude"] = geo["lat"]
-            result.loc[mask, "Longitude"] = geo["lng"]
+        result.loc[needs, "GeoStatus"] = matched["_GeoStatus"].fillna("").values
+        result.loc[needs, "GeoAttempts"] = matched["_GeoAttempts"].fillna(0).astype(int).values
+        result.loc[needs, "GeoMethod"] = matched["_GeoMethod"].fillna("").values
+        result.loc[needs, "GoogleLocationType"] = matched["_GoogleLocationType"].fillna("").values
+        result.loc[needs, "GoogleFormattedAddress"] = matched["_GoogleFormattedAddress"].fillna("").values
+        result.loc[needs, "GooglePlaceID"] = matched["_GooglePlaceID"].fillna("").values
+        result.loc[needs, "GoogleCountryCode"] = matched["_GoogleCountryCode"].fillna("").values
+        result.loc[needs, "GooglePostalCode"] = matched["_GooglePostalCode"].fillna("").values
+        result.loc[needs, "GooglePartialMatch"] = matched["_GooglePartialMatch"].fillna(False).astype(bool).values
+        result.loc[needs, "AddrOnlyBetter"] = matched["_AddrOnlyBetter"].fillna(False).astype(bool).values
 
-        # Per-row audit flags can differ when duplicate addresses carry different source country codes.
-        for idx in result.index[mask]:
-            row_geo = dict(geo)
-            result.at[idx, "GeoQualityFlag"] = _quality_flags(
-                row_geo, result.at[idx, "_cc"], result.at[idx, "_postal"], bool(result.at[idx, "_street"])
-            )
+        ok_coords = (
+            matched["_GeoStatus"].eq("OK")
+            & pd.to_numeric(matched["_GeoLat"], errors="coerce").notna()
+            & pd.to_numeric(matched["_GeoLng"], errors="coerce").notna()
+        )
+        ok_idx = matched.index[ok_coords]
+        result.loc[ok_idx, "Latitude"] = matched.loc[ok_idx, "_GeoLat"].values
+        result.loc[ok_idx, "Longitude"] = matched.loc[ok_idx, "_GeoLng"].values
+
+        # Quality flags depend on source-country/postcode evidence, so calculate them once per source row.
+        # This is at most one pass over the rows being geocoded, rather than one full scan per unique job.
+        for idx in target_rows.index:
+            key_tuple = tuple(result.at[idx, c] for c in dedupe_cols)
+            geo = geo_by_key.get(key_tuple)
+            if geo:
+                result.at[idx, "GeoQualityFlag"] = _quality_flags(
+                    geo, result.at[idx, "_cc"], result.at[idx, "_postal"], bool(result.at[idx, "_street"])
+                )
 
     succeeded = sum(1 for g in local_results.values() if g.get("status") == "OK")
     failed = total - succeeded
@@ -909,6 +966,101 @@ def apply_column_mapping(df, mapping):
         if src != UNMAPPED and src in df.columns:
             out[field] = df[src].values
     return out
+
+
+def render_geocode_results(res_df, comp_df, run_skip_existing):
+    """Render saved results outside the Geocode button event so Streamlit reruns do not erase them."""
+    if res_df is None:
+        return
+
+    st.subheader("Results")
+    st.dataframe(res_df, use_container_width=True)
+    st.download_button(
+        "📥 Download geocoded CSV", res_df.to_csv(index=False),
+        "geocoded_output.csv", "text/csv", key="dl_geocoded"
+    )
+
+    # Map preview
+    md = res_df[["StreetAddress", "Latitude", "Longitude"]].copy()
+    md["Latitude"] = pd.to_numeric(md["Latitude"], errors="coerce")
+    md["Longitude"] = pd.to_numeric(md["Longitude"], errors="coerce")
+    md = md.dropna(subset=["Latitude", "Longitude"])
+    if len(md) > 10000:
+        md = md.sample(10000, random_state=42)
+        st.caption("Map preview sampled to 10,000 points for browser performance; downloaded results contain all rows.")
+    if len(md) > 0:
+        st.subheader("Map Preview")
+        st.markdown("Hover over a point to see the address.")
+        clat, clng = md["Latitude"].mean(), md["Longitude"].mean()
+        sp = max(md["Latitude"].max() - md["Latitude"].min(),
+                 md["Longitude"].max() - md["Longitude"].min())
+        zm = 14 if sp < 0.01 else 11 if sp < 0.1 else 8 if sp < 1 else 5 if sp < 10 else 2
+        ps = st.slider("Point size (pixels)", 2, 20, 6, 1, key="result_point_size")
+        layer = pdk.Layer(
+            "ScatterplotLayer", data=md, get_position=["Longitude", "Latitude"], get_radius=100,
+            radius_min_pixels=ps, radius_max_pixels=ps * 3,
+            get_fill_color=[65, 105, 225, 180], pickable=True, auto_highlight=True
+        )
+        tip = {
+            "html": "<b>{StreetAddress}</b><br/>Lat: {Latitude}<br/>Lng: {Longitude}",
+            "style": {"backgroundColor": "#1a1a2e", "color": "white", "fontSize": "12px"},
+        }
+        st.pydeck_chart(pdk.Deck(
+            layers=[layer],
+            initial_view_state=pdk.ViewState(latitude=clat, longitude=clng, zoom=zm, pitch=0),
+            tooltip=tip, map_provider="carto", map_style="light"
+        ))
+
+    # Recommendations
+    has_tiv = "_TIV" in res_df.columns
+    total_tiv = res_df["_TIV"].sum() if has_tiv else 0
+    rec_df = build_recommendations(res_df, comp_df, has_tiv=has_tiv, total_tiv=total_tiv)
+
+    if rec_df is not None and len(rec_df) > 0:
+        st.subheader("Step 5: Recommendations")
+        if has_tiv and total_tiv > 0:
+            flagged_tiv = rec_df["TIV"].fillna(0).sum()
+            clean_tiv = total_tiv - flagged_tiv
+            clean_pct = clean_tiv / total_tiv * 100
+            st.markdown(
+                f"**{clean_pct:.1f}%** of portfolio TIV (**{clean_tiv:,.0f}** of {total_tiv:,.0f}) "
+                f"geocoded to ROOFTOP with no flags — no action needed on those."
+            )
+
+        st.markdown("The following rows need attention. Clean ROOFTOP primary results are not listed.")
+        cat_counts = rec_df["Category"].value_counts()
+        for cat in sorted(
+            cat_counts.index,
+            key=lambda x: rec_df.loc[rec_df["Category"] == x, "Priority"].iloc[0]
+        ):
+            cat_tiv = ""
+            if has_tiv and "TIV" in rec_df.columns:
+                cat_total = rec_df.loc[rec_df["Category"] == cat, "TIV"].fillna(0).sum()
+                if cat_total > 0:
+                    cat_pct = cat_total / total_tiv * 100 if total_tiv > 0 else 0
+                    cat_tiv = f" — TIV: {cat_total:,.0f} ({cat_pct:.1f}% of portfolio)"
+            st.markdown(f"- {cat}: **{cat_counts[cat]}** row(s){cat_tiv}")
+
+        display_cols = [c for c in rec_df.columns if c != "Priority"]
+        st.dataframe(rec_df[display_cols], use_container_width=True)
+        st.download_button(
+            "📥 Download recommendations CSV", rec_df[display_cols].to_csv(index=False),
+            "geocode_recommendations.csv", "text/csv", key="dl_rec"
+        )
+    else:
+        st.success("🎉 All addresses geocoded at ROOFTOP precision — no recommendations needed!")
+
+    if not run_skip_existing:
+        if comp_df is not None and len(comp_df) > 0:
+            st.subheader("Comparison Report")
+            st.markdown("Original vs newly geocoded coordinates, with distance and quality.")
+            st.dataframe(comp_df, use_container_width=True)
+            st.download_button(
+                "📥 Download comparison report", comp_df.to_csv(index=False),
+                "geocode_comparison_report.csv", "text/csv", key="dl_comp"
+            )
+        else:
+            st.info("ℹ️ No comparison report — no rows had existing coordinates.")
 
 
 # =============================================================================
@@ -1084,88 +1236,17 @@ if uploaded:
             st.error("Enter your API key in the sidebar.")
         else:
             res_df, comp_df = process_dataframe(df_m, api_key, target_rps, max_workers, skip_existing)
+            if res_df is not None:
+                st.session_state["_last_geocode_results"] = res_df
+                st.session_state["_last_geocode_comparison"] = comp_df
+                st.session_state["_last_geocode_skip_existing"] = skip_existing
 
-            st.subheader("Results")
-            st.dataframe(res_df, use_container_width=True)
-            st.download_button("📥 Download geocoded CSV", res_df.to_csv(index=False),
-                               "geocoded_output.csv", "text/csv")
-
-            # Map preview
-            md = res_df[["StreetAddress", "Latitude", "Longitude"]].copy()
-            md["Latitude"] = pd.to_numeric(md["Latitude"], errors="coerce")
-            md["Longitude"] = pd.to_numeric(md["Longitude"], errors="coerce")
-            md = md.dropna(subset=["Latitude", "Longitude"])
-            if len(md) > 10000:
-                md = md.sample(10000, random_state=42)
-                st.caption("Map preview sampled to 10,000 points for browser performance; downloaded results contain all rows.")
-            if len(md) > 0:
-                st.subheader("Map Preview")
-                st.markdown("Hover over a point to see the address.")
-                clat, clng = md["Latitude"].mean(), md["Longitude"].mean()
-                sp = max(md["Latitude"].max() - md["Latitude"].min(),
-                         md["Longitude"].max() - md["Longitude"].min())
-                zm = 14 if sp < 0.01 else 11 if sp < 0.1 else 8 if sp < 1 else 5 if sp < 10 else 2
-                ps = st.slider("Point size (pixels)", 2, 20, 6, 1)
-                layer = pdk.Layer("ScatterplotLayer", data=md,
-                                  get_position=["Longitude", "Latitude"], get_radius=100,
-                                  radius_min_pixels=ps, radius_max_pixels=ps * 3,
-                                  get_fill_color=[65, 105, 225, 180], pickable=True, auto_highlight=True)
-                tip = {"html": "<b>{StreetAddress}</b><br/>Lat: {Latitude}<br/>Lng: {Longitude}",
-                       "style": {"backgroundColor": "#1a1a2e", "color": "white", "fontSize": "12px"}}
-                st.pydeck_chart(pdk.Deck(layers=[layer],
-                                         initial_view_state=pdk.ViewState(latitude=clat, longitude=clng, zoom=zm, pitch=0),
-                                         tooltip=tip, map_provider="carto", map_style="light"))
-
-            # Recommendations
-            has_tiv = "_TIV" in res_df.columns
-            total_tiv = res_df["_TIV"].sum() if has_tiv else 0
-            rec_df = build_recommendations(res_df, comp_df, has_tiv=has_tiv, total_tiv=total_tiv)
-
-            if rec_df is not None and len(rec_df) > 0:
-                st.subheader("Step 5: Recommendations")
-
-                # Show clean TIV summary first
-                if has_tiv and total_tiv > 0:
-                    flagged_tiv = rec_df["TIV"].fillna(0).sum()
-                    clean_tiv = total_tiv - flagged_tiv
-                    clean_pct = clean_tiv / total_tiv * 100
-                    st.markdown(
-                        f"**{clean_pct:.1f}%** of portfolio TIV (**{clean_tiv:,.0f}** of {total_tiv:,.0f}) "
-                        f"geocoded to ROOFTOP with no flags — no action needed on those."
-                    )
-
-                st.markdown(
-                    "The following rows need attention. "
-                    "Clean ROOFTOP primary results are not listed."
-                )
-                cat_counts = rec_df["Category"].value_counts()
-                for cat in sorted(cat_counts.index, key=lambda x: rec_df.loc[rec_df["Category"] == x, "Priority"].iloc[0]):
-                    cat_tiv = ""
-                    if has_tiv and "TIV" in rec_df.columns:
-                        cat_total = rec_df.loc[rec_df["Category"] == cat, "TIV"].fillna(0).sum()
-                        if cat_total > 0:
-                            cat_pct = cat_total / total_tiv * 100 if total_tiv > 0 else 0
-                            cat_tiv = f" — TIV: {cat_total:,.0f} ({cat_pct:.1f}% of portfolio)"
-                    st.markdown(f"- {cat}: **{cat_counts[cat]}** row(s){cat_tiv}")
-
-                display_cols = [c for c in rec_df.columns if c != "Priority"]
-                st.dataframe(rec_df[display_cols], use_container_width=True)
-                st.download_button("📥 Download recommendations CSV",
-                                   rec_df[display_cols].to_csv(index=False),
-                                   "geocode_recommendations.csv", "text/csv", key="dl_rec")
-            else:
-                st.success("🎉 All addresses geocoded at ROOFTOP precision — no recommendations needed!")
-
-            # Comparison report
-            if not skip_existing:
-                if comp_df is not None and len(comp_df) > 0:
-                    st.subheader("Comparison Report")
-                    st.markdown("Original vs newly geocoded coordinates, with distance and quality.")
-                    st.dataframe(comp_df, use_container_width=True)
-                    st.download_button("📥 Download comparison report", comp_df.to_csv(index=False),
-                                       "geocode_comparison_report.csv", "text/csv", key="dl_comp")
-                else:
-                    st.info("ℹ️ No comparison report — no rows had existing coordinates.")
+    # Results persist across normal Streamlit reruns (map slider, download clicks, sidebar changes).
+    render_geocode_results(
+        st.session_state.get("_last_geocode_results"),
+        st.session_state.get("_last_geocode_comparison"),
+        st.session_state.get("_last_geocode_skip_existing", True),
+    )
 
 else:
     st.markdown(
