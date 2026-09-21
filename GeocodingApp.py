@@ -5,6 +5,7 @@ import time
 import math
 import re
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pydeck as pdk
 
@@ -22,30 +23,30 @@ if not api_key:
 st.sidebar.header("Settings")
 skip_existing = st.sidebar.checkbox("Skip rows that already have valid coordinates", value=True)
 
-# Ark Google Cloud project quota: 6,000 Geocoding v3 requests/minute (100/sec).
-# Default to 95/sec to leave a small safety margin for quota-window jitter and other users of the same project.
+# Ark Google Cloud project quota: 6,000 Geocoding v3 requests/minute.
+# The user controls the per-run QPM target. The hard project ceiling is still shared globally.
 GOOGLE_QPM_QUOTA = 6000
-GOOGLE_RPS_HARD_LIMIT = GOOGLE_QPM_QUOTA // 60
-GOOGLE_RPS_DEFAULT = 95
+GOOGLE_QPM_DEFAULT = 5400
 
-target_rps = st.sidebar.slider(
-    "Google requests per second", 5, 99, GOOGLE_RPS_DEFAULT, 1,
+target_qpm = st.sidebar.slider(
+    "Google requests per minute", 300, GOOGLE_QPM_QUOTA, GOOGLE_QPM_DEFAULT, 100,
     help=(
-        f"Ark quota is {GOOGLE_QPM_QUOTA:,} requests/minute ({GOOGLE_RPS_HARD_LIMIT}/sec). "
-        "The default 95/sec leaves a small safety margin below the project limit."
+        f"Ark's approved Geocoding v3 quota is {GOOGLE_QPM_QUOTA:,} requests/minute. "
+        "This controls actual outbound Google requests, including retries and fallbacks. "
+        "You can select the full 6,000 for maximum throughput, but running exactly at the project ceiling "
+        "can still produce occasional OVER_QUERY_LIMIT responses around quota-window boundaries."
     )
 )
 max_workers = st.sidebar.slider(
     "Concurrent workers", 8, 128, 96, 8,
     help=(
-        "Number of address jobs processed concurrently. The 96-worker default is sized to keep the "
-        "95 requests/sec limiter busy even when Google responses take around a second. "
-        "API calls are still capped by the requests/sec setting."
+        "Number of address jobs processed concurrently. Workers do not bypass the QPM limiter; "
+        "they simply keep requests ready while other workers wait for Google responses."
     )
 )
 st.sidebar.caption(
-    f"Approved Geocoding v3 quota: {GOOGLE_QPM_QUOTA:,} requests/minute. "
-    f"Recommended operating rate: {GOOGLE_RPS_DEFAULT}/sec."
+    f"Approved Geocoding v3 quota: {GOOGLE_QPM_QUOTA:,}/min. "
+    f"Current run target: {target_qpm:,}/min (~{target_qpm / 60:.1f}/sec average)."
 )
 
 st.sidebar.header("Cache")
@@ -95,24 +96,133 @@ AU_POSTCODE_STATE = {
 
 LOCATION_TYPE_RANK = {"ROOFTOP": 4, "RANGE_INTERPOLATED": 3, "GEOMETRIC_CENTER": 2, "APPROXIMATE": 1}
 
-CACHE_VERSION = "v2-fast-soft-country"
+CACHE_VERSION = "v3-rolling-qpm"
 _thread_local = threading.local()
 
 
-class RateLimiter:
-    """Thread-safe fixed-rate limiter used per actual Google request."""
-    def __init__(self, requests_per_second):
-        self.interval = 1.0 / max(float(requests_per_second), 0.1)
-        self.lock = threading.Lock()
-        self.next_allowed = time.monotonic()
+class RollingQpmLimiter:
+    """Thread-safe rolling-60-second limiter with shared quota back-pressure.
+
+    Every real outbound HTTP request is registered here, including retries. The rolling
+    window is the source of truth; a small derived spacing is also used to avoid needless
+    micro-bursts while still allowing the user to choose any QPM target up to the project quota.
+    """
+    def __init__(self, qpm_limit, label="run"):
+        self.qpm_limit = max(1, int(qpm_limit))
+        self.label = label
+        self.window_seconds = 60.0
+        self.timestamps = deque()
+        self.condition = threading.Condition()
+        self.next_smoothed = time.monotonic()
+        self.total_requests = 0
+        self.peak_rolling_qpm = 0
+        self.over_query_limit_events = 0
+        self.cooldown_until = 0.0
+        self._oql_streak = 0
+        self._last_oql = 0.0
+
+    def _purge(self, now):
+        cutoff = now - self.window_seconds
+        while self.timestamps and self.timestamps[0] <= cutoff:
+            self.timestamps.popleft()
 
     def wait(self):
-        with self.lock:
+        """Wait until one request slot is available, then register that request."""
+        while True:
+            with self.condition:
+                now = time.monotonic()
+                self._purge(now)
+
+                if now < self.cooldown_until:
+                    self.condition.wait(timeout=max(0.01, self.cooldown_until - now))
+                    continue
+
+                if len(self.timestamps) >= self.qpm_limit:
+                    wait_for = max(0.01, self.timestamps[0] + self.window_seconds - now + 0.01)
+                    self.condition.wait(timeout=wait_for)
+                    continue
+
+                # Smooth the chosen QPM across the minute. The rolling window above remains
+                # the hard cap; this simply avoids releasing large bursts at once.
+                interval = self.window_seconds / self.qpm_limit
+                if now < self.next_smoothed:
+                    self.condition.wait(timeout=max(0.001, self.next_smoothed - now))
+                    continue
+
+                self.timestamps.append(now)
+                self.next_smoothed = max(now, self.next_smoothed) + interval
+                self.total_requests += 1
+                self.peak_rolling_qpm = max(self.peak_rolling_qpm, len(self.timestamps))
+                return
+
+    def report_over_query_limit(self):
+        """Pause all workers sharing this limiter when Google says the quota is saturated."""
+        with self.condition:
             now = time.monotonic()
-            wait_for = max(0.0, self.next_allowed - now)
-            self.next_allowed = max(now, self.next_allowed) + self.interval
-        if wait_for > 0:
-            time.sleep(wait_for)
+            self.over_query_limit_events += 1
+            if now - self._last_oql <= 10.0:
+                self._oql_streak = min(self._oql_streak + 1, 5)
+            else:
+                self._oql_streak = 1
+            self._last_oql = now
+            cooldown = min(12.0, 0.75 * (2 ** (self._oql_streak - 1)))
+            self.cooldown_until = max(self.cooldown_until, now + cooldown)
+            self.condition.notify_all()
+
+    def report_success(self):
+        with self.condition:
+            now = time.monotonic()
+            if self._last_oql and now - self._last_oql > 15.0:
+                self._oql_streak = 0
+
+    def snapshot(self):
+        with self.condition:
+            now = time.monotonic()
+            self._purge(now)
+            return {
+                "current_rolling_qpm": len(self.timestamps),
+                "peak_rolling_qpm": self.peak_rolling_qpm,
+                "total_requests": self.total_requests,
+                "over_query_limit_events": self.over_query_limit_events,
+                "cooldown_remaining": max(0.0, self.cooldown_until - now),
+                "qpm_limit": self.qpm_limit,
+            }
+
+
+@st.cache_resource
+def get_project_quota_limiter():
+    """One 6,000-QPM guard shared by all Streamlit sessions in this app process."""
+    return RollingQpmLimiter(GOOGLE_QPM_QUOTA, label="project")
+
+
+class CombinedLimiter:
+    """Apply both the user-selected run limit and the shared project limit."""
+    def __init__(self, run_qpm):
+        self.run = RollingQpmLimiter(run_qpm, label="run")
+        self.project = get_project_quota_limiter()
+
+    def wait(self):
+        # Local limit first, then the shared project ceiling.
+        self.run.wait()
+        self.project.wait()
+
+    def report_over_query_limit(self):
+        self.run.report_over_query_limit()
+        self.project.report_over_query_limit()
+
+    def report_success(self):
+        self.run.report_success()
+        self.project.report_success()
+
+    def snapshot(self):
+        snap = self.run.snapshot()
+        project = self.project.snapshot()
+        snap.update({
+            "project_current_rolling_qpm": project["current_rolling_qpm"],
+            "project_peak_rolling_qpm": project["peak_rolling_qpm"],
+            "project_oql_events": project["over_query_limit_events"],
+        })
+        return snap
 
 
 def _http_session():
@@ -201,8 +311,12 @@ def score_result_against_constraints(result, country_code=None, admin1=None, adm
 
 
 def single_geocode_call(address, key, components=None, country_code=None, admin1=None,
-                        admin2=None, city=None, postal_code=None, limiter=None, retries=2):
-    """One Google request with bounded retries and rich provenance."""
+                        admin2=None, city=None, postal_code=None, limiter=None, retries=4):
+    """One Google geocoding strategy with bounded retries and exact request accounting.
+
+    Every retry passes through the same rolling-QPM limiter. OVER_QUERY_LIMIT triggers a
+    global pause for all workers using this limiter rather than merely sleeping one worker.
+    """
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     params = {"address": address, "key": key}
     if components:
@@ -210,9 +324,24 @@ def single_geocode_call(address, key, components=None, country_code=None, admin1
 
     last_status = "UNKNOWN"
     last_error = ""
+    request_count = 0
+    quota_events = 0
+    status_history = []
+
+    def failure_payload(status):
+        return {
+            "lat": None, "lng": None, "status": status, "location_type": None,
+            "match_score": 0, "formatted_address": "", "place_id": "",
+            "google_country": "", "google_postal": "", "partial_match": False,
+            "error_message": last_error, "api_calls": request_count,
+            "quota_events": quota_events, "status_history": status_history[:],
+        }
+
     for attempt in range(retries + 1):
         if limiter:
             limiter.wait()
+        request_count += 1
+
         try:
             resp = _http_session().get(url, params=params, timeout=12)
             resp.raise_for_status()
@@ -220,15 +349,17 @@ def single_geocode_call(address, key, components=None, country_code=None, admin1
             status = data.get("status", "UNKNOWN")
             last_status = status
             last_error = clean_text(data.get("error_message", ""))
+            status_history.append(status)
 
             if status == "OK" and data.get("results"):
+                if limiter:
+                    limiter.report_success()
                 scored = []
                 for pos, result in enumerate(data["results"]):
                     loc_type = result.get("geometry", {}).get("location_type", "UNKNOWN")
                     precision = LOCATION_TYPE_RANK.get(loc_type, 0)
                     match_score = score_result_against_constraints(
                         result, country_code, admin1, admin2, city, postal_code)
-                    # Stable tie-break keeps Google's ranking when our scores are equal.
                     scored.append((match_score, precision, -pos, result))
                 scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
                 match_score, _, _, best = scored[0]
@@ -244,19 +375,26 @@ def single_geocode_call(address, key, components=None, country_code=None, admin1
                     "google_country": google_country.upper(),
                     "google_postal": google_postal,
                     "partial_match": bool(best.get("partial_match", False)),
-                    "error_message": "",
+                    "error_message": "", "api_calls": request_count,
+                    "quota_events": quota_events, "status_history": status_history[:],
                 }
 
-            # Quota/transient statuses are worth retrying. ZERO_RESULTS is not.
-            if status in {"OVER_QUERY_LIMIT", "UNKNOWN_ERROR"} and attempt < retries:
-                time.sleep(0.5 * (2 ** attempt))
+            if status == "OVER_QUERY_LIMIT":
+                quota_events += 1
+                if limiter:
+                    limiter.report_over_query_limit()
+                if attempt < retries:
+                    # The limiter owns the global cooldown. The next retry will wait there.
+                    continue
+                return failure_payload(status)
+
+            if status == "UNKNOWN_ERROR" and attempt < retries:
+                time.sleep(min(4.0, 0.5 * (2 ** attempt)))
                 continue
-            return {
-                "lat": None, "lng": None, "status": status, "location_type": None,
-                "match_score": 0, "formatted_address": "", "place_id": "",
-                "google_country": "", "google_postal": "", "partial_match": False,
-                "error_message": last_error,
-            }
+
+            # ZERO_RESULTS, REQUEST_DENIED and INVALID_REQUEST are terminal for this strategy.
+            return failure_payload(status)
+
         except requests.Timeout:
             last_status, last_error = "TIMEOUT", "Google request timed out."
         except requests.ConnectionError:
@@ -266,15 +404,11 @@ def single_geocode_call(address, key, components=None, country_code=None, admin1
         except Exception as exc:
             last_status, last_error = "ERROR", str(exc)
 
+        status_history.append(last_status)
         if attempt < retries:
-            time.sleep(0.5 * (2 ** attempt))
+            time.sleep(min(4.0, 0.5 * (2 ** attempt)))
 
-    return {
-        "lat": None, "lng": None, "status": last_status, "location_type": None,
-        "match_score": 0, "formatted_address": "", "place_id": "",
-        "google_country": "", "google_postal": "", "partial_match": False,
-        "error_message": last_error,
-    }
+    return failure_payload(last_status)
 
 
 def _query_parts(*values):
@@ -354,17 +488,24 @@ def geocode_address(full_address, street_address, key, country_code=None, city=N
             "method": "failed", "fallback": False, "detail": "No usable address/geography fields.",
             "api_calls": 0, "formatted_address": "", "place_id": "", "google_country": "",
             "google_postal": "", "partial_match": False, "quality_flag": "No searchable address",
-            "error_message": "",
+            "error_message": "", "quota_events": 0, "status_history": [],
         }
 
     candidates = []
     api_calls = 0
+    quota_events = 0
     statuses = []
+    status_history = []
+    last_error = ""
 
     for idx, (method, query) in enumerate(queries):
         r = single_geocode_call(query, key, limiter=limiter, **score_kwargs)
-        api_calls += 1
+        api_calls += int(r.get("api_calls", 1))
+        quota_events += int(r.get("quota_events", 0))
         statuses.append(r.get("status", "UNKNOWN"))
+        status_history.extend(r.get("status_history", []))
+        if r.get("error_message"):
+            last_error = r.get("error_message", "")
         if r.get("status") == "OK":
             candidates.append((method, r))
             # Strong first-pass results stop immediately. RANGE_INTERPOLATED is intentionally
@@ -376,14 +517,17 @@ def geocode_address(full_address, street_address, key, country_code=None, city=N
         # If the primary failed, continue. If it succeeded weakly, fallbacks may improve it.
 
     if not candidates:
-        final_status = next((x for x in reversed(statuses) if x not in {"ZERO_RESULTS", "UNKNOWN"}), statuses[-1] if statuses else "ZERO_RESULTS")
+        # Report the final strategy's terminal status. A transient quota response from an earlier
+        # attempt must not turn a later genuine ZERO_RESULTS into a fake quota failure.
+        final_status = statuses[-1] if statuses else "ZERO_RESULTS"
         detail = diagnose_failure(full_address, city, admin1, admin2, postal_code, country_code)
         return {
             "lat": None, "lng": None, "status": final_status, "location_type": None,
             "method": "failed", "fallback": False, "detail": detail, "api_calls": api_calls,
             "formatted_address": "", "place_id": "", "google_country": "", "google_postal": "",
             "partial_match": False, "quality_flag": "Geocoding failed",
-            "error_message": "",
+            "error_message": last_error, "quota_events": quota_events,
+            "status_history": status_history,
         }
 
     # Prefer geography consistency first, then precision. This prevents a stray rooftop result
@@ -406,6 +550,8 @@ def geocode_address(full_address, street_address, key, country_code=None, city=N
         "detail": " ".join(detail_parts),
         "quality_flag": flag,
         "api_calls": api_calls,
+        "quota_events": quota_events,
+        "status_history": status_history,
     }
 
 
@@ -607,7 +753,7 @@ def validate_dataframe(df, skip):
 # GEOCODING
 # =============================================================================
 
-def process_dataframe(df, key, target_rps, max_workers, skip):
+def process_dataframe(df, key, target_qpm, max_workers, skip):
     result = df.copy()
     result["Latitude"] = pd.to_numeric(result["Latitude"], errors="coerce")
     result["Longitude"] = pd.to_numeric(result["Longitude"], errors="coerce")
@@ -641,6 +787,8 @@ def process_dataframe(df, key, target_rps, max_workers, skip):
     result["GeoMethod"] = ""
     result["GeoStatus"] = ""
     result["GeoAttempts"] = 0
+    result["GeoQuotaEvents"] = 0
+    result["GeoStatusHistory"] = ""
     result["GeoQualityFlag"] = ""
     result["GoogleFormattedAddress"] = ""
     result["GooglePlaceID"] = ""
@@ -666,7 +814,7 @@ def process_dataframe(df, key, target_rps, max_workers, skip):
         for job in jobs[:5]:
             st.text(job["_full_addr"])
 
-    limiter = RateLimiter(target_rps)
+    limiter = CombinedLimiter(target_qpm)
     with st.spinner("Validating API key…"):
         test = single_geocode_call("10 Downing Street, London", key, limiter=limiter, retries=0)
         if test["status"] == "REQUEST_DENIED":
@@ -683,6 +831,8 @@ def process_dataframe(df, key, target_rps, max_workers, skip):
     completed = 0
     failures = 0
     fallbacks = 0
+    recovered_quota_jobs = 0
+    permanent_quota_failures = 0
 
     def cache_key(job):
         return (CACHE_VERSION, job["_full_addr"], job["_street"], job["_city"], job["_admin1"], job["_admin2"], job["_postal"])
@@ -725,23 +875,32 @@ def process_dataframe(df, key, target_rps, max_workers, skip):
                     "method": "failed", "fallback": False, "detail": str(exc), "api_calls": 0,
                     "formatted_address": "", "place_id": "", "google_country": "", "google_postal": "",
                     "partial_match": False, "quality_flag": "Worker error", "error_message": str(exc),
+                    "quota_events": 0, "status_history": ["WORKER_ERROR"],
                 }
             local_results[ck] = geo
             total_api_calls += int(geo.get("api_calls", 0))
+            quota_events = int(geo.get("quota_events", 0))
             if geo.get("status") == "OK":
                 # Cache successes only. Transient failures never poison the rest of the session.
                 geo_cache[ck] = geo
                 if geo.get("fallback"):
                     fallbacks += 1
+                if quota_events > 0:
+                    recovered_quota_jobs += 1
             else:
                 failures += 1
+                if geo.get("status") == "OVER_QUERY_LIMIT":
+                    permanent_quota_failures += 1
             completed += 1
 
             now = time.monotonic()
             if now - last_ui_update >= 0.15 or completed == total:
                 prog.progress(completed / total, text=f"Geocoding {completed:,} of {total:,} unique jobs…")
+                snap = limiter.snapshot()
                 status_area.caption(
-                    f"{completed:,}/{total:,} complete | {total_api_calls:,} Google calls | "
+                    f"{completed:,}/{total:,} complete | {snap['total_requests']:,} actual Google requests | "
+                    f"rolling minute {snap['current_rolling_qpm']:,}/{target_qpm:,} | "
+                    f"peak {snap['peak_rolling_qpm']:,} | {snap['over_query_limit_events']:,} quota responses | "
                     f"{cache_hits:,} cached | {failures:,} failed so far"
                 )
                 last_ui_update = now
@@ -766,6 +925,8 @@ def process_dataframe(df, key, target_rps, max_workers, skip):
             **{c: job_dict[c] for c in dedupe_cols},
             "_GeoStatus": geo.get("status", ""),
             "_GeoAttempts": int(geo.get("api_calls", 0)),
+            "_GeoQuotaEvents": int(geo.get("quota_events", 0)),
+            "_GeoStatusHistory": " > ".join(map(str, geo.get("status_history", []))),
             "_GeoMethod": geo.get("method", ""),
             "_GoogleLocationType": geo.get("location_type") or "",
             "_GoogleFormattedAddress": geo.get("formatted_address", ""),
@@ -787,6 +948,8 @@ def process_dataframe(df, key, target_rps, max_workers, skip):
 
         result.loc[needs, "GeoStatus"] = matched["_GeoStatus"].fillna("").values
         result.loc[needs, "GeoAttempts"] = matched["_GeoAttempts"].fillna(0).astype(int).values
+        result.loc[needs, "GeoQuotaEvents"] = matched["_GeoQuotaEvents"].fillna(0).astype(int).values
+        result.loc[needs, "GeoStatusHistory"] = matched["_GeoStatusHistory"].fillna("").values
         result.loc[needs, "GeoMethod"] = matched["_GeoMethod"].fillna("").values
         result.loc[needs, "GoogleLocationType"] = matched["_GoogleLocationType"].fillna("").values
         result.loc[needs, "GoogleFormattedAddress"] = matched["_GoogleFormattedAddress"].fillna("").values
@@ -817,10 +980,15 @@ def process_dataframe(df, key, target_rps, max_workers, skip):
 
     succeeded = sum(1 for g in local_results.values() if g.get("status") == "OK")
     failed = total - succeeded
+    final_snap = limiter.snapshot()
     status_area.markdown(
         f"**{succeeded:,}** unique locations geocoded, **{failed:,}** failed. "
-        f"**{total_api_calls:,}** Google calls, **{cache_hits:,}** cache hits, "
-        f"**{fallbacks:,}** fallback resolutions. **{len(result):,}** source rows."
+        f"**{final_snap['total_requests']:,}** actual Google requests this run, "
+        f"peak rolling minute **{final_snap['peak_rolling_qpm']:,}/{target_qpm:,}**. "
+        f"Google returned **{final_snap['over_query_limit_events']:,}** OVER_QUERY_LIMIT response(s); "
+        f"**{recovered_quota_jobs:,}** job(s) recovered after quota back-off and "
+        f"**{permanent_quota_failures:,}** finished as quota failures. "
+        f"**{cache_hits:,}** cache hits, **{fallbacks:,}** fallback resolutions, **{len(result):,}** source rows."
     )
 
     # Comparison report before internal columns are removed.
@@ -1235,7 +1403,7 @@ if uploaded:
         if not api_key:
             st.error("Enter your API key in the sidebar.")
         else:
-            res_df, comp_df = process_dataframe(df_m, api_key, target_rps, max_workers, skip_existing)
+            res_df, comp_df = process_dataframe(df_m, api_key, target_qpm, max_workers, skip_existing)
             if res_df is not None:
                 st.session_state["_last_geocode_results"] = res_df
                 st.session_state["_last_geocode_comparison"] = comp_df
