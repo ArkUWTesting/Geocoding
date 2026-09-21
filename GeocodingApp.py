@@ -10,15 +10,15 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pydeck as pdk
 
-st.set_page_config(page_title="Ark Batch Geocoder", page_icon="G", layout="wide")
-st.title("Ark Batch Geocoder")
-st.caption("Fast batch geocoding with progressive geographic fallbacks, explicit quality levels, and auditable failure reasons.")
-st.caption(f"Build {APP_VERSION}")
-
 # Ark Google Cloud project quota: 6,000 Geocoding v3 requests/minute.
 GOOGLE_QPM_QUOTA = 6000
 GOOGLE_QPM_DEFAULT = 5400
 APP_VERSION = "v5-progressive-fallbacks"
+
+st.set_page_config(page_title="Ark Batch Geocoder", page_icon="G", layout="wide")
+st.title("Ark Batch Geocoder")
+st.caption("Fast batch geocoding with progressive geographic fallbacks, explicit quality levels, and auditable failure reasons.")
+st.caption(f"Build {APP_VERSION}")
 
 # Session state
 for key, default in {
